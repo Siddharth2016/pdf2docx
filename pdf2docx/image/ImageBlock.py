@@ -1,67 +1,29 @@
 # -*- coding: utf-8 -*-
 
 '''
-Image block objects based on PDF raw dict extracted with PyMuPDF.
+Definition of Image block objects. 
+
+Note the raw image block will be merged into text block: Text > Line > Span.
 
 @created: 2020-07-22
 @author: train8808@gmail.com
----
-https://pymupdf.readthedocs.io/en/latest/textpage.html
-
-    {
-        'type': 1,
-        'bbox': (x0,y0,x1,y1),
-        'ext': 'png',
-        'width': w,
-        'height': h,
-        'image': b'',
-        'colorspace': n,
-        'xref': xref, 'yref': yref, 'bpc': bpc
-    }
-
-Note: the raw image block will be merged into text block: Text > Line > Span.
-
 '''
 
-from docx.shared import Pt
+from io import BytesIO
 from ..text.Line import Line
 from ..text.TextBlock import TextBlock
 from .Image import Image
 from .ImageSpan import ImageSpan
-from ..common import utils
-from ..common import docx
 from ..common.Block import Block
+from ..common.docx import add_float_image
 
-
-class ImageBlock(Block, Image):
+class ImageBlock(Image, Block): # to get Image.plot() in first priority
     '''Image block.'''
-    def __init__(self, raw: dict):
-        super(ImageBlock, self).__init__(raw)
+    def __init__(self, raw:dict=None):
+        super().__init__(raw)
 
         # set type
-        self.set_image_block()
-
-
-    def store(self):
-        res = super(ImageBlock, self).store()
-        res.update(
-            super(ImageBlock, self).store_image()
-        )
-        return res
-
-
-    def plot(self, page):
-        '''Plot image bbox with diagonal lines.
-            ---
-            Args: 
-              - page: fitz.Page object
-        '''
-        x0, y0, x1, y1 = self.bbox
-        color = utils.RGB_component_from_name('blue')
-
-        page.drawLine((x0, y0), (x1, y1), color=color, width=1)
-        page.drawLine((x0, y1), (x1, y0), color=color, width=1)
-        page.drawRect(self.bbox, color=color, fill=None, overlay=False)
+        self.set_inline_image_block()
 
 
     def to_text_block(self):
@@ -81,36 +43,48 @@ class ImageBlock(Block, Image):
         block.set_text_block()
 
         return block
-        
-
-    def parse_text_format(self, rects):
-        '''parse text format with style represented by rectangles. Not necessary for image block.'''
-        return False
 
 
-    def make_docx(self, p, X0:float):
-        ''' Create paragraph for an image block.
+    def store(self):
+        res = super().store()
+        res.update(
+            super().store_image()
+        )
+        return res
+
+
+class FloatImageBlock(Image, Block): # to get Image.plot() in first priority
+    '''Floating Image block.'''
+    def __init__(self, raw:dict=None):
+        super().__init__(raw)
+
+        # set type
+        self.set_float_image_block()
+    
+
+    def store(self):
+        res = super().store()
+        res.update(
+            super().store_image()
+        )
+        return res
+
+    
+    def plot(self, page):
+        '''Plot image bbox with diagonal lines.
+            ---
+            Args: 
+            - page: fitz.Page object
+        '''
+        super().plot(page, color=(1,0,0))
+
+
+    def make_docx(self, p):
+        ''' Create floating image behind text.
             ---
             Args:
               - p: docx paragraph instance
-              - X0: left border of the paragraph
         '''
-        # indent and space setting
-        before_spacing = max(round(self.before_space, 1), 0.0)
-        after_spacing = max(round(self.after_space, 1), 0.0)
-        pf = docx.reset_paragraph_format(p)
-        pf.space_before = Pt(before_spacing)
-        pf.space_after = Pt(after_spacing)
-        
-        # restore default tabs
-        pf.tab_stops.clear_all()
-
-        # left indent implemented with tab
-        pos = round(self.bbox.x0-X0, 2)
-        pf.tab_stops.add_tab_stop(Pt(pos))
-        docx.add_stop(p, Pt(pos), Pt(0.0))
-
-        # create image
-        docx.add_image(p, self.image, self.bbox.x1-self.bbox.x0)
-
+        x0, y0, x1, y1 = self.bbox
+        add_float_image(p, BytesIO(self.image), width=x1-x0, pos_x=x0, pos_y=y0)
         return p

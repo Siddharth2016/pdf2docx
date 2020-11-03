@@ -19,18 +19,15 @@ https://pymupdf.readthedocs.io/en/latest/textpage.html
 
 from fitz import Point
 from ..common.BBox import BBox
-from ..common.base import TextDirection
+from ..common.share import TextDirection
 from .Spans import Spans
 from ..image.ImageSpan import ImageSpan
 
 
 class Line(BBox):
     '''Object representing a line in text block.'''
-    def __init__(self, raw:dict={}) -> None:
-        # bbox is calculated from contained spans
-        # so remove key 'bbox' here
-        if 'bbox' in raw: raw.pop('bbox') 
-        super(Line, self).__init__(raw)
+    def __init__(self, raw:dict=None):
+        if raw is None: raw = {}
 
         # writing mode
         self.wmode = raw.get('wmode', 0) 
@@ -45,15 +42,19 @@ class Line(BBox):
         # This ID can't be changed once set -> record the original parent extracted from PDF, 
         # so that we can determin whether two lines belong to a same original text block.
         self._pid = None
+        
+        # remove key 'bbox' since it is calculated from contained spans
+        if 'bbox' in raw: raw.pop('bbox') 
+        super().__init__(raw)
 
         # collect spans
-        self.spans = Spans(None, self).from_dicts(raw.get('spans', []))
+        self.spans = Spans(parent=self).from_dicts(raw.get('spans', []))        
 
     
     @property
     def text(self):
         '''Joining span text.'''
-        spans_text = [span.text for span in self.spans]        
+        spans_text = [span.text.strip() for span in self.spans] # strip span text
         return ''.join(spans_text)
 
 
@@ -88,6 +89,11 @@ class Line(BBox):
             self._pid = int(pid)
 
 
+    def strip(self):
+        '''remove redundant blanks at the begin/end span.'''
+        return self.spans.strip()
+
+
     def same_parent_with(self, line):
         '''Check if has same parent ID.'''
         if self.pid is None:
@@ -96,7 +102,7 @@ class Line(BBox):
             return self.pid == line.pid
 
 
-    def store(self) -> dict:
+    def store(self):
         res = super().store()
         res.update({
             'wmode': self.wmode,
@@ -107,15 +113,6 @@ class Line(BBox):
         })
 
         return res
-
-
-    def plot(self, page, color:int):
-        '''Plot line border in red.
-           ---
-            Args: 
-              - page: fitz.Page object
-        '''
-        page.drawRect(self.bbox, color=color, fill=None, overlay=False)
 
 
     def add(self, span_or_list):
@@ -157,26 +154,7 @@ class Line(BBox):
         return line
 
 
-    def in_same_row(self, line):
-        ''' Check whether in same row/line with specified line. Note text direction.
-
-            taking horizontal text as an example:
-            - yes: the bottom edge of each box is lower than the centerline of the other one;
-            - otherwise, not in same row.
-
-            Note the difference with method `horizontally_align_with`. They may not in same line, though
-            aligned horizontally.
-        '''
-        if not line or self.text_direction != line.text_direction:
-            return False
-
-        # normal reading direction by default
-        idx = 1 if self.is_horizontal else 0
-
-        c1 = (self.bbox[idx] + self.bbox[idx+2]) / 2.0
-        c2 = (line.bbox[idx] + line.bbox[idx+2]) / 2.0
-
-        # Note y direction under PyMuPDF context
-        res = c1<=line.bbox[idx+2] and c2<=self.bbox[idx+2]
-        return res
+    def make_docx(self, p):
+        for span in self.spans:
+            span.make_docx(p)
             

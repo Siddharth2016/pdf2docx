@@ -40,16 +40,16 @@ from docx.oxml.ns import qn
 
 from .Char import Char
 from ..common.BBox import BBox
-from ..common.base import RectType
-from ..common.constants import DICT_FONTS
-from ..common import utils, docx
-from ..shape.Rectangle import Rectangle
+from ..common.share import RectType
+from ..common import constants
+from ..common import share, docx
+from ..shape.Shape import Shape
 
 
 class TextSpan(BBox):
     '''Object representing text span.'''
-    def __init__(self, raw:dict={}) -> None:
-        super(TextSpan, self).__init__(raw)
+    def __init__(self, raw:dict=None):
+        if raw is None: raw = {}
         self.color = raw.get('color', 0)
         self._font = raw.get('font', '')
         self.size = raw.get('size', 12.0)
@@ -59,9 +59,12 @@ class TextSpan(BBox):
         # introduced attributes
         # a list of dict: { 'type': int, 'color': int }
         self.style = raw.get('style', [])
+        
+        # init bbox
+        super().__init__(raw)
 
         # update bbox if no font is set
-        if 'UNNAMED' in self.font.upper(): self.set_font('Arial')
+        if 'UNNAMED' in self.font.upper(): self.set_font('Arial')        
 
 
     @property
@@ -79,14 +82,10 @@ class TextSpan(BBox):
 
         # mapping font name
         key = font_name.replace(' ', '').replace('-', '').replace('_', '').upper() # normalize mapping key
-        font_name = DICT_FONTS.get(key, font_name)
-
-        # split with upper case letters
-        blank = ' '
-        # font_name = ''.join(f'{blank}{x}' if x.isupper() else x for x in font_name).strip(blank)
+        font_name = constants.DICT_FONTS.get(key, font_name)
 
         # replace ','
-        font_name = font_name.replace(',', blank)
+        font_name = font_name.replace(',', ' ')
 
         return font_name
 
@@ -96,6 +95,13 @@ class TextSpan(BBox):
         '''Joining chars in text span'''
         chars = [char.c for char in self.chars]        
         return ''.join(chars)
+
+    
+    def cal_bbox(self):
+        '''calculate bbox based on contained instances.'''
+        bbox = fitz.Rect()
+        for char in self.chars: bbox |= char.bbox
+        return bbox
 
 
     def set_font(self, fontname):
@@ -135,21 +141,45 @@ class TextSpan(BBox):
         buff = (rect.height-self.size)/2.0
         y0 = rect.y0 + buff
         y1 = rect.y1 - buff
-        self.update((x0, y0, x1, y1))
+        self.update_bbox((x0, y0, x1, y1))
 
         # update contained char bbox
         for char in self.chars:
             x0, _, x1, _ = char.bbox
-            char.update((x0, y0, x1, y1))
+            char.update_bbox((x0, y0, x1, y1))
 
 
     def add(self, char:Char):
         '''Add char and update bbox accordingly.'''
         self.chars.append(char)
-        self.union(char)
+        self.union_bbox(char)
+
+    
+    def lstrip(self):
+        '''remove blanks at the left side, but keep one blank.'''
+        original_text = self.text
+        if not original_text.startswith(' '*2): return False
+
+        # keep one blank
+        num_blanks = len(original_text) - len(original_text.lstrip())
+        self.chars = self.chars[num_blanks-1:]
+        self.update_bbox(rect=self.cal_bbox())
+        return True
+    
+
+    def rstrip(self):
+        '''remove blanks at the right side, but keep one blank.'''
+        original_text = self.text
+        if not original_text.endswith(' '*2): return False
+
+        # keep one blank
+        num_blanks = len(original_text) - len(original_text.rstrip())
+        self.chars = self.chars[:1-num_blanks]
+        self.update_bbox(rect=self.cal_bbox())
+        return True
 
 
-    def store(self) -> dict:
+    def store(self):
         res = super().store()
         res.update({
             'color': self.color,
@@ -165,16 +195,10 @@ class TextSpan(BBox):
         return res
 
 
-    def plot(self, page, color:tuple):
-        '''Fill bbox with given color.
-           ---
-            Args: 
-              - page: fitz.Page object
-        '''
-        page.drawRect(self.bbox, color=color, fill=color, width=0, overlay=False)
+    def plot(self, page, color:tuple): super().plot(page, stroke=color, fill=color, width=0)
 
 
-    def split(self, rect:Rectangle, horizontal:bool=True):
+    def split(self, rect:Shape, horizontal:bool=True):
         '''Split span with the intersection: span-intersection-span.'''
         # any intersection in this span?
         intsec = rect.bbox & self.bbox
@@ -215,14 +239,14 @@ class TextSpan(BBox):
                 bbox = (self.bbox.x0, self.bbox.y0, intsec.x0, self.bbox.y1)
             else:
                 bbox = (self.bbox.x0, intsec.y1, self.bbox.x1, self.bbox.y1)
-            split_span = self.copy().update(bbox)
+            split_span = self.copy().update_bbox(bbox)
             split_span.chars = self.chars[0:pos]
             split_spans.append(split_span)
 
         # middle intersection part if exists
         if length > 0:
             bbox = (intsec.x0, intsec.y0, intsec.x1, intsec.y1)
-            split_span = self.copy().update(bbox)
+            split_span = self.copy().update_bbox(bbox)
             split_span.chars = self.chars[pos:pos_end]            
             split_span.parse_text_style(rect, horizontal)  # update style
             split_spans.append(split_span)
@@ -233,14 +257,14 @@ class TextSpan(BBox):
                 bbox = (intsec.x1, self.bbox.y0, self.bbox.x1, self.bbox.y1)
             else:
                 bbox = (self.bbox.x0, self.bbox.y0, self.bbox.x1, intsec.y0)
-            split_span = self.copy().update(bbox)
+            split_span = self.copy().update_bbox(bbox)
             split_span.chars = self.chars[pos_end:]
             split_spans.append(split_span)
 
         return split_spans
 
 
-    def parse_text_style(self, rect: Rectangle, horizontal:bool=True):
+    def parse_text_style(self, rect: Shape, horizontal:bool=True):
         '''Parse text style based on the position to a span bbox.'''
 
         # consider text format type only
@@ -261,7 +285,7 @@ class TextSpan(BBox):
         # highlight: both the rect height and overlap must be large enough
         if h_rect >= 0.5*h_span:
             # In general, highlight color isn't white
-            if rect.color != utils.RGB_value((1,1,1)) and utils.get_main_bbox(self.bbox, rect.bbox, 0.75): 
+            if rect.color != share.rgb_value((1,1,1)) and self.get_main_bbox(rect, constants.FACTOR_MAJOR): 
                 rect.type = RectType.HIGHLIGHT
     
         # near to bottom of span? yes, underline
@@ -305,12 +329,12 @@ class TextSpan(BBox):
         # furcher check chars in span
         span = self.copy()
         span.chars.clear()
-        span.update((0.0,0.0,0.0,0.0))
+        span.update_bbox((0.0,0.0,0.0,0.0))
 
         for char in self.chars:
-            if utils.get_main_bbox(char.bbox, rect, 0.55): # contains at least a half part
+            if char.get_main_bbox(rect, constants.FACTOR_A_HALF): # contains at least a half part
                 span.chars.append(char)
-                span.union(char)
+                span.union_bbox(char)
 
         return span
 
@@ -338,7 +362,7 @@ class TextSpan(BBox):
         font_name = self.font
         docx_span.font.name = font_name
         docx_span._element.rPr.rFonts.set(qn('w:eastAsia'), font_name) # set font for chinese characters
-        docx_span.font.color.rgb = RGBColor(*utils.RGB_component(self.color))
+        docx_span.font.color.rgb = RGBColor(*share.rgb_component(self.color))
 
         # font size
         # NOTE: only x.0 and x.5 is accepted in docx, so set character scaling accordingly

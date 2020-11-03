@@ -17,14 +17,15 @@ from ..common.BBox import BBox
 
 class Row(BBox):
     '''Row in a table.'''
-    def __init__(self, raw:dict={}):
-        super(Row, self).__init__(raw)
+    def __init__(self, raw:dict=None):
+        if raw is None: raw = {}
+        super().__init__(raw)
 
         # logical row height
         self.height = raw.get('height', 0.0)
 
         # cells in row
-        self._cells = Cells(None, self).from_dicts(raw.get('cells', []))
+        self._cells = Cells(parent=self).from_dicts(raw.get('cells', []))
 
 
     def __getitem__(self, idx):
@@ -48,7 +49,7 @@ class Row(BBox):
         self._cells.append(cell)
 
 
-    def store(self) -> dict:
+    def store(self):
         res = super().store()
         res.update({
             'height': self.height,

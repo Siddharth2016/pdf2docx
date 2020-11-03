@@ -10,29 +10,30 @@ Table Cell object.
 from docx.shared import Pt
 from ..text.TextBlock import TextBlock
 from ..common.BBox import BBox
-from ..common.utils import RGB_component
+from ..common.share import rgb_component
 from ..common import docx
-from ..layout import Blocks # avoid conflict
+from ..layout import Blocks # avoid import conflict
+from ..text.Line import Line
+from ..text.Lines import Lines
 
 
 class Cell(BBox):
     ''' Cell object.'''
-    def __init__(self, raw:dict={}):
-        if raw is None: raw = {}
-        super(Cell, self).__init__(raw)
-        self.bg_color = raw.get('bg_color', None) # type: int
+    def __init__(self, raw:dict=None):
+        if raw is None: raw = {}        
+        self.bg_color     = raw.get('bg_color', None) # type: int
         self.border_color = raw.get('border_color', (0,0,0,0)) # type: tuple [int]
         self.border_width = raw.get('border_width', (0,0,0,0)) # type: tuple [float]
         self.merged_cells = raw.get('merged_cells', (1,1)) # type: tuple [int]
 
         # collect blocks
-        # NOTE: The cell bbox is determined first, and then find blocks contained in this bbox.
-        # so, don't update cell bbox when appending blocks, i.e. set parent=None.
-        self.blocks = Blocks.Blocks().from_dicts(raw.get('blocks', []))
+        self.blocks = Blocks.Blocks(parent=self).from_dicts(raw.get('blocks', []))
+
+        super().__init__(raw)
 
 
     @property
-    def text(self) -> str:
+    def text(self):
         '''Text contained in this cell.'''
         return '\n'.join([block.text for block in self.blocks]) if bool(self) else None
 
@@ -44,21 +45,22 @@ class Cell(BBox):
               - cell: Cell instance to compare
               - threshold: two bboxes are considered same if the overlap area exceeds threshold.
         '''
+        # bbox
         res, msg = super().compare(cell, threshold)
-        if not res:
-            return res, msg
-        
+        if not res: return res, msg
+
+        # cell style        
         if self.bg_color != cell.bg_color:
-            return False, f'Inconsistent background color @ Cell {self.bbox}:\n{self.bg_color} v.s. {cell.bg_color}'
+            return False, f'Inconsistent background color @ Cell {self.bbox}:\n{self.bg_color} v.s. {cell.bg_color} (expected)'
 
         if tuple(self.border_color) != tuple(cell.border_color):
-            return False, f'Inconsistent border color @ Cell {self.bbox}:\n{self.border_color} v.s. {cell.border_color}'
+            return False, f'Inconsistent border color @ Cell {self.bbox}:\n{self.border_color} v.s. {cell.border_color} (expected)'
 
         if tuple(self.border_width) != tuple(cell.border_width):
-            return False, f'Inconsistent border width @ Cell {self.bbox}:\n{self.border_width} v.s. {cell.border_width}'
+            return False, f'Inconsistent border width @ Cell {self.bbox}:\n{self.border_width} v.s. {cell.border_width} (expected)'
 
         if tuple(self.merged_cells) != tuple(cell.merged_cells):
-            return False, f'Inconsistent count of merged cells @ Cell {self.bbox}:\n{self.merged_cells} v.s. {cell.merged_cells}'
+            return False, f'Inconsistent count of merged cells @ Cell {self.bbox}:\n{self.merged_cells} v.s. {cell.merged_cells} (expected)'
 
         return True, ''
 
@@ -90,24 +92,22 @@ class Cell(BBox):
         # plot cell style
         if style:
             # border color and width
-            bc = [x/255.0 for x in RGB_component(self.border_color[0])]
+            bc = [x/255.0 for x in rgb_component(self.border_color[0])]
             w = self.border_width[0]
 
             # shading color
             if self.bg_color != None:
-                sc = [x/255.0 for x in RGB_component(self.bg_color)] 
+                sc = [x/255.0 for x in rgb_component(self.bg_color)] 
             else:
                 sc = None
-            page.drawRect(self.bbox, color=bc, fill=sc, width=w, overlay=False)
+            super().plot(page, stroke=bc, fill=sc, width=w)
         
         # or just cell borders for illustration
         else:
-            page.drawRect(self.bbox, color=color, fill=None, width=1, overlay=False)
+            super().plot(page, stroke=color, fill=None)
 
         # plot blocks contained in cell
-        if content:
-            for block in self.blocks:
-                block.plot(page)
+        if content: self.blocks.plot(page)
 
 
     def add(self, block):
@@ -131,10 +131,40 @@ class Cell(BBox):
         
         # NOTE: add each line as a single text block to avoid overlap between table block and combined lines
         split_block = TextBlock()
-        for line in block.lines:
-            L = line.intersects(self.bbox)
-            split_block.add(L)
+        lines = [line.intersects(self.bbox) for line in block.lines]
+        split_block.add(lines)
         self.blocks.append(split_block)
+
+
+    def set_stream_table_layout(self, settings:dict):
+        '''Set stream table layout to ensure any float layout converted to flow layout.'''
+        # create nest table if float layout still exists
+        from .TablesConstructor import TablesConstructor
+        from .TableStructure import TableStructure
+
+        # bbox range of stream table
+        inner_bbox, outer_bbox = self.bbox, self.bbox
+        outer_borders = TablesConstructor._outer_borders(inner_bbox, outer_bbox)
+
+        # stream table contents        
+        def sub_lines(block): # get sub-lines from block
+            return block.lines if block.is_text_block() else [Line().update_bbox(block.bbox)]
+        table_lines = Lines()
+        for block in self.blocks:
+            table_lines.extend(sub_lines(block))
+
+        # parse stream borders
+        strokes = TablesConstructor.stream_strokes(table_lines, outer_borders, showing_borders=[], showing_shadings=[])
+        if not strokes: return
+
+        # parse table structure
+        strokes.sort_in_reading_order() # required
+        table = TableStructure(strokes, settings).parse(fills=[]).to_table_block()
+        if not table: return
+
+        # parse table content
+        table.set_stream_table_block()
+        self.blocks.assign_table_contents([table], settings)
 
 
     def make_docx(self, table, indexes):
@@ -171,7 +201,7 @@ class Cell(BBox):
         # But, docx requires at least one paragraph in each cell, otherwise resulting in a repair error. 
         if self.blocks:
             docx_cell._element.clear_content()
-            self.blocks.make_page(docx_cell, self.bbox)
+            self.blocks.make_page(docx_cell)
 
 
     def _set_style(self, table, indexes):
@@ -191,19 +221,21 @@ class Cell(BBox):
         # ---------------------
         # NOTE: border width is specified in eighths of a point, with a minimum value of 
         # two (1/4 of a point) and a maximum value of 96 (twelve points)
-        if self.border_width and sum(self.border_width)>0.0:
-            keys = ('top', 'end', 'bottom', 'start')
-            kwargs = {}
-            for k, w, c in zip(keys, self.border_width, self.border_color):
-                hex_c = f'#{hex(c)[2:].zfill(6)}'
-                kwargs[k] = {
-                    'sz': 8*w, 'val': 'single', 'color': hex_c.upper()
-                }
-            # merged cells are assumed to have same borders with the main cell        
-            for m in range(i, i+n_row):
-                for n in range(j, j+n_col):
-                    docx.set_cell_border(table.cell(m, n), **kwargs)
-        
+        keys = ('top', 'end', 'bottom', 'start')
+        kwargs = {}
+        for k, w, c in zip(keys, self.border_width, self.border_color):
+            # skip if width=0 -> will not show in docx
+            if not w: continue
+
+            hex_c = f'#{hex(c)[2:].zfill(6)}'
+            kwargs[k] = {
+                'sz': 8*w, 'val': 'single', 'color': hex_c.upper()
+            }
+
+        # merged cells are assumed to have same borders with the main cell        
+        for m in range(i, i+n_row):
+            for n in range(j, j+n_col):
+                docx.set_cell_border(table.cell(m, n), **kwargs)        
 
         # ---------------------
         # cell bg-color
@@ -219,5 +251,5 @@ class Cell(BBox):
         docx.set_cell_margins(docx_cell, start=0, end=0)
 
         # set vertical direction if contained text blocks are in vertical direction
-        if self.blocks.is_vertical:
+        if self.blocks.is_vertical_text:
             docx.set_vertical_cell_direction(docx_cell)

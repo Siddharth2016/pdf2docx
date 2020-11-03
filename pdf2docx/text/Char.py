@@ -19,18 +19,19 @@ raw dict for Char
 
 
 from ..common.BBox import BBox
-from ..shape.Rectangle import Rectangle
+from ..shape.Shape import Shape
 
 
 class Char(BBox):
     '''Object representing a character.'''
-    def __init__(self, raw:dict={}) -> None:
-        super(Char, self).__init__(raw)
+    def __init__(self, raw:dict=None):
+        if raw is None: raw = {}
         self.c = raw.get('c', '')
-        self.origin = raw.get('origin', None)       
+        self.origin = raw.get('origin', None)
+        super().__init__(raw)
 
 
-    def contained_in_rect(self, rect:Rectangle, horizontal:bool=True):
+    def contained_in_rect(self, rect:Shape, horizontal:bool=True):
         ''' Detect whether locates in a rect, or has an intersection 
             larger than half of the char bbox.
         '''
@@ -47,7 +48,7 @@ class Char(BBox):
                 return intsec.height > 0.5*self.bbox.height
 
 
-    def store(self) -> dict:
+    def store(self):
         res = super().store()
         res.update({
             'c': self.c,

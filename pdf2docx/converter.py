@@ -3,12 +3,10 @@
 import os
 import json
 from time import perf_counter
+from multiprocessing import Pool, cpu_count
 import fitz
 from docx import Document
-
 from .layout.Layout import Layout
-from .common.base import PlotControl
-from multiprocessing import Pool, cpu_count
 
 
 class Converter:
@@ -18,21 +16,13 @@ class Converter:
         with python-docx.
     '''
 
-    def __init__(self, pdf_file:str, docx_file:str=None):
+    def __init__(self, pdf_file:str):
         ''' Initialize fitz object with given pdf file path; initialize docx object.'''
         # pdf/docx filename
-        self.filename_pdf = pdf_file
-        self.filename_docx = docx_file if docx_file else pdf_file.replace('.pdf', '.docx')
-        if os.path.exists(self.filename_docx): os.remove(self.filename_docx)
+        self.filename_pdf = pdf_file        
 
         # fitz object to read pdf
-        self._doc_pdf = fitz.open(pdf_file)
-
-        # docx object to write file
-        self._doc_docx = Document()
-
-        # layout object: main worker
-        self._layout = None # type: Layout        
+        self._doc_pdf = fitz.Document(pdf_file)
 
 
     def __getitem__(self, index):
@@ -47,168 +37,160 @@ class Converter:
             return self._doc_pdf[index]
 
 
-    def __len__(self):
-        return len(self._doc_pdf)
+    def __len__(self): return len(self._doc_pdf)
 
-
-    @property
-    def layout(self): return self._layout
 
     @property
     def doc_pdf(self): return self._doc_pdf
 
-    @property
-    def doc_docx(self): return self._doc_docx
-
-    def save(self): self._doc_docx.save(self.filename_docx)
 
     def close(self): self._doc_pdf.close()
 
 
-    def make_page(self, page:fitz.Page, debug=True):
-        ''' Parse and create single page.
-            If debug=True, illustration pdf will be created during parsing the raw pdf layout.
+    @staticmethod
+    def parse(page:fitz.Page, config:dict=None):
+        ''' Parse one specified pdf `page` and return a Layout object.'''        
+        return Layout(page, config).parse()
+
+
+    def debug_page(self, i:int, docx_filename:str=None, config:dict=None):
+        ''' Parse, create and plot single page for debug purpose.
+            Illustration pdf will be created during parsing the raw pdf layout.
         '''
-        # debug information
+        config = config if config else {}
+
+        # include debug information
         # fitz object in debug mode: plot page layout
         # file path for this debug pdf: demo.pdf -> debug_demo.pdf
         path, filename = os.path.split(self.filename_pdf)
         filename_json  = os.path.join(path, 'layout.json')
-        debug_kwargs = {
-            'debug'   : debug,
-            'doc'     : fitz.open() if debug else None,
+        debug_doc = fitz.Document()
+        config.update({
+            'debug'   : True,
+            'doc'     : debug_doc,
             'filename': os.path.join(path, f'debug_{filename}')
-        }
+        })
 
-        # init page layout
-        self.initialize(page)
-        if debug: 
-            self._layout.plot(debug_kwargs['doc'], 'Original Text Blocks', key=PlotControl.LAYOUT)
-            self._layout.plot(debug_kwargs['doc'], 'Original Rectangle Shapes', key=PlotControl.SHAPE)
-
-        # parse and save page
-        self.layout.parse(**debug_kwargs).make_page(self.doc_docx)
-        self.save()
-
-        # save debug files
-        if debug:
-            # save layout plotting as pdf file
-            debug_kwargs['doc'].save(debug_kwargs['filename'])
-            # write layout information
-            self.layout.serialize(filename_json)
-
-        return self
-
-
-    def make_docx(self, page_indexes:list, multi_processing=False):
-        '''Parse and create a list of pages.
-            ---
-            Args:
-            - page_indexes    : list[int], page indexes to parse
-            - multi_processing: bool, multi-processing mode if True
-        '''
-        t0 = perf_counter()
-        if multi_processing:
-            self._make_docx_multi_processing(page_indexes)
-        else:
-            self._make_docx(page_indexes)
+        # parse and make page
+        layouts = self.make_docx(docx_filename, pages=[i], config=config)
         
+        # layout information for debugging
+        layouts[0].serialize(filename_json) 
+
+        return layouts[0]
+
+
+    def make_docx(self, docx_filename=None, start=0, end=None, pages=None, config:dict=None):
+        ''' Convert specified PDF pages to DOCX file.
+            docx_filename : DOCX filename to write to
+            start         : first page to process, starting from zero if --zero_based_index=True
+            end           : last page to process, starting from zero if --zero_based_index=True
+            pages         : range of pages
+            config        : configuration parameters
+        '''
+        config = config if config else {}
+        
+        # DOCX file to convert to
+        docx_file = Document() 
+        filename = docx_filename if docx_filename else self.filename_pdf.replace('.pdf', '.docx')
+        if os.path.exists(filename): os.remove(filename)
+
+        # PDF pages to convert
+        zero_based = config.get('zero_based_index', True)
+        page_indexes = self._page_indexes(start, end, pages, len(self), zero_based)
+        
+        # convert page by page
+        t0 = perf_counter()        
+        if config.get('multi_processing', False):
+            layouts = self._make_docx_multi_processing(docx_file, page_indexes, config)
+        else:
+            layouts = self._make_docx(docx_file, page_indexes, config)       
         print(f'\n{"-"*50}\nTerminated in {perf_counter()-t0}s.')
 
+        # save docx
+        docx_file.save(filename)
 
-    def extract_tables(self, page_indexes:list):
-        '''Extract table contents.'''
+        return layouts
+
+
+    def extract_tables(self, start=0, end=None, pages=None, config:dict=None):
+        '''Extract table contents from specified PDF pages.'''
+        # PDF pages to convert
+        config = config if config else {}
+        zero_based = config.get('zero_based_index', True)
+        page_indexes = self._page_indexes(start, end, pages, len(self), zero_based)
+
+        # process page by page
         tables = []
-        num_pages = len(page_indexes)
-        # process page by page        
+        num_pages = len(page_indexes)        
         for i in page_indexes:
             print(f'\rProcessing Pages: {i+1}/{num_pages}...')
-            page = self.doc_pdf[i]
-            page_tables = self.initialize(page).extract_tables()
+            page_tables = self.parse(self.doc_pdf[i], config).extract_tables()
             tables.extend(page_tables)
 
         return tables
 
 
-    def initialize(self, page:fitz.Page):
-        '''Initialize layout object.'''
-        # Layout object based on raw dict
-        # NOTE: all these coordinates are relative to un-rotated page
-        # https://pymupdf.readthedocs.io/en/latest/page.html#modifying-pages
-        raw_layout = page.getText('rawdict')
-
-        # though 'width', 'height' are contained in `raw_dict`, they are based on un-rotated page.
-        # so, update page width/height to right direction in case page is rotated
-        *_, w, h = page.rect # always reflecting page rotation
-        raw_layout.update({ 'width' : w, 'height': h })
-        self._layout = Layout(raw_layout, page.rotationMatrix)
-        
-        # get rectangle shapes from page source
-        self._layout.rects.from_stream(self.doc_pdf, page)
-        
-        # get annotations(comment shapes) from PDF page, e.g. 
-        # highlight, underline and strike-through-line        
-        self._layout.rects.from_annotations(page)
-
-        return self._layout
-
-
-    def _make_docx(self, page_indexes:list):
+    def _make_docx(self, docx_file:Document, page_indexes:list, config:dict):
         ''' Parse and create pages based on page indexes.
             ---
             Args:
+            - docx_file   : docx.Document, docx file write to
             - page_indexes: list[int], page indexes to parse
         '''
+        layouts = []
         num_pages = len(page_indexes)
         for i in page_indexes:
             print(f'\rProcessing Pages: {i+1}/{num_pages}...', end='', flush=True)
-            page = self.doc_pdf[i]
-            self.initialize(page).parse().make_page(self.doc_docx)
-        self.save()
+            layout = self.parse(self.doc_pdf[i], config)            
+            layout.make_page(docx_file) # write to docx
+            layouts.append(layout)
+        
+        return layouts
 
 
-    def _make_docx_multi_processing(self, page_indexes:list):
+    def _make_docx_multi_processing(self, docx_file:Document, page_indexes:list, config:dict):
         ''' Parse and create pages based on page indexes.
             ---
             Args:
+            - docx_file   : docx.Document, docx file write to
             - page_indexes: list[int], page indexes to parse
 
             https://pymupdf.readthedocs.io/en/latest/faq.html#multiprocessing
         '''
         # make vectors of arguments for the processes
-        cpu = cpu_count()
+        cpu = min(config['cpu_count'], cpu_count()) if 'cpu_count' in config else cpu_count()
         start, end = min(page_indexes), max(page_indexes)
         prefix_layout = 'layout'
-        vectors = [(i, cpu, start, end, self.filename_pdf, f'{prefix_layout}-{i}.json') for i in range(cpu)]
+        vectors = [(i, cpu, start, end, self.filename_pdf, config, f'{prefix_layout}-{i}.json') for i in range(cpu)]
 
         # start parsing processes
         pool = Pool()
         pool.map(self._make_docx_per_cpu, vectors, 1)
         
-        # restore layouts
+        # read parsed layout data
         raw_layouts = {}
         for i in range(cpu):
             filename = f'{prefix_layout}-{i}.json'
-            if not os.path.exists(filename): continue
-
-            # read parsed layouts
+            if not os.path.exists(filename): continue            
             with open(filename, 'r') as f:
                 raw_layouts.update(json.load(f))
-
             os.remove(filename)
         
-        # create docx pages
+        # restore layouts and create docx pages
         print()
         num_pages = len(page_indexes)
+        layouts = []
         for page_index in page_indexes:
             key = str(page_index)
             if key not in raw_layouts: continue
 
             print(f'\rCreating Pages: {page_index+1}/{num_pages}...', end='')
-            raw_layout = raw_layouts[key]
-            Layout(raw_layout).make_page(self.doc_docx)
-
-        self.save()
+            layout = Layout()
+            layout.restore(raw_layouts[key]).make_page(docx_file)
+            layouts.append(layout)
+        
+        return layouts
 
 
     @staticmethod
@@ -221,10 +203,11 @@ class Converter:
                 - 1  : count of CPUs
                 - 2,3: whole pages range to process since sometimes need only parts of pdf pages                
                 - 4  : pdf filename
-                - 5  : json filename storing parsed results
+                - 5  : configuration parameters
+                - 6  : json filename storing parsed results
         '''
         # recreate the arguments
-        idx, cpu, s, e, pdf_filename, json_filename = vector
+        idx, cpu, s, e, pdf_filename, config, json_filename = vector
 
         # worker
         cv = Converter(pdf_filename)
@@ -243,14 +226,29 @@ class Converter:
             page_index = pages_indexes[i]
             print(f'\rParsing Pages: {page_index+1}/{num_pages} per CPU {idx}...', end='', flush=True)
 
-            # parse page
-            page = cv.doc_pdf[page_index]
-            cv.initialize(page).parse()
-
-            # page results
-            res[page_index] = cv.layout.store()
+            # store page parsed results
+            page = cv.doc_pdf[page_index]            
+            res[page_index] = cv.parse(page, config).store()
 
         # serialize results
         with open(json_filename, 'w') as f:
             f.write(json.dumps(res))
-            
+
+
+    @staticmethod
+    def _page_indexes(start, end, pages, pdf_len, zero_based=True):
+        # index starts from zero or one
+        if not zero_based:
+            start = max(start-1, 0)
+            if end: end -= 1
+            if pages: pages = [i-1 for i in pages]
+
+        # parsing arguments
+        if pages: 
+            indexes = [int(x) for x in pages if 0<=x<pdf_len]
+        else:
+            end = end or pdf_len
+            s = slice(int(start), int(end))
+            indexes = range(pdf_len)[s]
+        
+        return indexes

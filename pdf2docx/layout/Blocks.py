@@ -7,59 +7,78 @@ A group of Text/Image or Table block.
 '''
 
 from docx.shared import Pt
-from ..common.constants import DM
+from ..common import constants
 from ..common.Collection import Collection
-from ..common.base import BlockType
+from ..common.share import BlockType
 from ..common.Block import Block
 from ..common.docx import reset_paragraph_format
 from ..text.TextBlock import TextBlock
 from ..text.Line import Line
 from ..text.Lines import Lines
-from ..image.ImageBlock import ImageBlock
+from ..image.ImageBlock import FloatImageBlock, ImageBlock
 from ..table.TableBlock import TableBlock
+from ..table.Cell import Cell
 
 
 class Blocks(Collection):
     '''Block collections.'''
-    def __init__(self, instances:list=[], parent=None) -> None:
+    def __init__(self, instances:list=[], parent=None):
         ''' A collection of TextBlock and TableBlock instances. 
             ImageBlock is converted to ImageSpan contained in TextBlock.'''
         self._parent = parent # type: Block
         self._instances = []  # type: list[TextBlock or TableBlock]
+
+        # NOTE: no changes on floating image blocks once identified, so store them here
+        self._floating_image_blocks = []
     
         # Convert all original image blocks to text blocks, i.e. ImageSpan,
         # So we can focus on single TextBlock later on; TableBlock is also combination of TextBlocks.
         for block in instances:
             if isinstance(block, ImageBlock):
                 text_block = block.to_text_block()
-                self._instances.append(text_block)
+                self.append(text_block)
             else:
-                self._instances.append(block)
+                self.append(block)
 
 
-    def from_dicts(self, raws:list):
-        for raw_block in raws:
-            block_type = raw_block.get('type', -1) # type: int
-            
-            # image block -> text block
-            if block_type==BlockType.IMAGE.value:
-                block = ImageBlock(raw_block).to_text_block()
-            
-            # text block
-            elif block_type == BlockType.TEXT.value:
-                block = TextBlock(raw_block)
+    def _update_bbox(self, block:Block):
+        ''' Override. The parent of block is generally Layout or Cell, which is not necessary to 
+            update its bbox. So, do nothing but required here.
+        '''
+        pass
 
-            # table block
-            elif block_type in (BlockType.LATTICE_TABLE.value, BlockType.STREAM_TABLE.value):
-                block = TableBlock(raw_block)
-            
-            else:
-                block = None            
-            
-            # add to list
-            self.append(block)
-        
-        return self
+
+    @property
+    def lattice_table_blocks(self):
+        '''Get lattice table blocks contained in this Collection.'''
+        return list(filter(
+            lambda block: block.is_lattice_table_block(), self._instances))
+
+
+    @property
+    def stream_table_blocks(self):
+        '''Get stream table blocks contained in this Collection.'''
+        return list(filter(
+            lambda block: block.is_stream_table_block(), self._instances))
+
+
+    @property
+    def table_blocks(self):
+        '''Get table blocks contained in this Collection.'''
+        return list(filter(
+            lambda block: block.is_table_block(), self._instances))
+
+
+    @property
+    def inline_image_blocks(self):
+        return list(filter(
+            lambda block: block.is_inline_image_block(), self._instances))
+
+
+    @property
+    def floating_image_blocks(self): 
+        return list(filter(
+            lambda block: block.is_float_image_block(), self._instances))
 
 
     def text_blocks(self, level=0):
@@ -81,7 +100,7 @@ class Blocks(Collection):
                     for cell in row:
                         blocks.extend(cell.blocks.text_blocks(level))
         return blocks
-    
+ 
 
     def image_spans(self, level=0):
         '''Get ImageSpan contained in this Collection.             
@@ -108,143 +127,179 @@ class Blocks(Collection):
                         spans.extend(cell.blocks.image_spans(level))        
         return spans
 
+    
+    def is_flow_layout(self, float_layout_tolerance:float):
+        '''Check if flow layout: 
+            - no more blocks in same row
+            - check further in table block lines level
+        '''
+        # block level
+        fun = lambda a, b: a.horizontally_align_with(b, factor=float_layout_tolerance)
+        groups = self.group(fun)
+        if len(groups) != len(self): return False
 
-    @property
-    def lattice_table_blocks(self):
-        '''Get lattice table blocks contained in this Collection.'''
-        return list(filter(
-            lambda block: block.is_lattice_table_block(), self._instances))
-
-    @property
-    def stream_table_blocks(self):
-        '''Get stream table blocks contained in this Collection.'''
-        return list(filter(
-            lambda block: block.is_stream_table_block(), self._instances))
-
-    @property
-    def table_blocks(self):
-        '''Get table blocks contained in this Collection.'''
-        return list(filter(
-            lambda block: block.is_table_block(), self._instances))
+        # block lines level
+        for block in self.text_blocks(level=0):
+            if not block.is_flow_layout(float_layout_tolerance): return False
+        return True
 
 
-    def clean(self, page_bbox):
-        '''Preprocess blocks initialized from the raw layout.'''
+    def combine_floating_objects(self):
+        self._instances.extend(self._floating_image_blocks)
 
+
+    def from_dicts(self, raws:list):
+        for raw_block in raws:
+            block_type = raw_block.get('type', -1) # type: int
+            
+            # inline image block -> text block
+            if block_type==BlockType.IMAGE.value:
+                block = ImageBlock(raw_block).to_text_block()
+            
+            # text block
+            elif block_type == BlockType.TEXT.value:
+                block = TextBlock(raw_block)
+            
+            # floating image block
+            elif block_type == BlockType.FLOAT_IMAGE.value:
+                block = FloatImageBlock(raw_block)
+
+            # table block
+            elif block_type in (BlockType.LATTICE_TABLE.value, BlockType.STREAM_TABLE.value):
+                block = TableBlock(raw_block)
+            
+            else:
+                block = None            
+            
+            # add to list
+            self.append(block)
+        
+        return self
+
+
+    def clean_up(self, float_image_ignorable_gap:float, line_overlap_threshold:float, line_merging_threshold:float):
+        ''' Preprocess blocks initialized from the raw layout.
+
+            NOTE: this method works ONLY for layout initialized from raw dict extracted by `page.getText()`.
+            Under this circumstance, it only exists text blocks since all raw image blocks are converted to 
+            text blocks.
+        '''
+        if not self._instances: return
         # filter function:
         # - remove blocks out of page
         # - remove transformed text: text direction is not (1, 0) or (0, -1)
         # - remove empty blocks
+        page_bbox = (0.0, 0.0, self.parent.width, self.parent.height)
         f = lambda block:   block.bbox.intersects(page_bbox) and \
                             block.text.strip() and (
-                            block.is_horizontal or block.is_vertical)
-        self._instances = list(filter(f, self._instances))
+                            block.is_horizontal_text or block.is_vertical_text)
+        self.reset(filter(f, self._instances))
            
         # merge blocks horizontally, e.g. remove overlap blocks, since no floating elements are supported
         # NOTE: It's to merge blocks in physically horizontal direction, i.e. without considering text direction.
-        self.sort_in_reading_order().join_horizontally(text_direction=False)
+        self.strip() \
+            .sort_in_reading_order() \
+            .identify_floating_images(float_image_ignorable_gap) \
+            .join_horizontally(text_direction=False, 
+                            line_overlap_threshold=line_overlap_threshold,
+                            line_merging_threshold=line_merging_threshold)
 
-        return True
+    
+    def strip(self):
+        ''' Remove redundant blanks exist in text block lines. 
+            Note these redundant blanks may affect bbox of text block.
+        '''
+        for block in self._instances: block.strip()
+        return self
 
 
-    def assign_table_contents(self, tables):
+    def identify_floating_images(self, float_image_ignorable_gap:float):
+        ''' Identify floating image lines and convert to ImageBlock.'''
+        lines = Lines()
+        for block in self._instances: # Note contain only text blocks
+            lines.extend(block.lines)
+        
+        # group by connectivity
+        groups = lines.group_by_connectivity(dx=-float_image_ignorable_gap, dy=-float_image_ignorable_gap)
+        
+        # identify floating objects
+        # ASSUMPTION: no overlaps between text lines
+        for group in filter(lambda group: len(group)>1, groups):
+            for line in group:
+                image_blocks = [FloatImageBlock().from_image(image_span) for image_span in line.image_spans]
+                if image_blocks:
+                    self._floating_image_blocks.extend(image_blocks)
+                    # remove this line from flow layout
+                    line.update_bbox((0,0,0,0))
+
+        return self
+
+
+    def assign_table_contents(self, tables:list, settings:dict):
         '''Add Text/Image/table block lines to associated cells of given tables.'''
         if not tables: return
 
-        # collect text blocks in table region        
+        # assign blocks to table region        
         blocks_in_tables = [[] for _ in tables] # type: list[list[Block]]
         blocks = []   # type: list[Block]
         for block in self._instances:
-
-            # lines in block for further check if necessary
-            lines = block.lines if block.is_text_block() else []
-
-            # collect blocks contained in table region
-            # NOTE: there is a probability that only a part of a text block is contained in table region, 
-            # while the rest is in normal block region.
-            for table, blocks_in_table in zip(tables, blocks_in_tables):
-
-                # fully contained in one table
-                if table.bbox.contains(block.bbox):
-                    blocks_in_table.append(block)
-                    break
-                
-                # not possible in current table, then check next table
-                elif not table.bbox.intersects(block.bbox): continue
-                
-                # deep into line level for text block
-                elif block.is_text_block():
-                    text_block = TextBlock()
-                    rest_lines = []
-                    for line in lines:
-                        if table.bbox.intersects(line.bbox):
-                            text_block.add(line)
-                        else:
-                            rest_lines.append(line)
-                    
-                    # summary
-                    blocks_in_table.append(text_block)
-                    if rest_lines:
-                        lines = rest_lines # for forther check
-                    else:
-                        break # no more lines
+            self._assign_block_to_tables(block, tables, blocks_in_tables, blocks)
             
-            # Now, this block (or part of it) belongs to previous layout
-            else:
-                if block.is_table_block():
-                    blocks.append(block)
-                else:
-                    text_block = TextBlock()
-                    for line in lines:
-                        text_block.add(line)
-                    blocks.append(text_block)
-
         # assign blocks to associated cells
         for table, blocks_in_table in zip(tables, blocks_in_tables):
             # no contents for this table
             if not blocks_in_table: continue
-            for row in table:
-                for cell in row:
-                    if not cell: continue
-                    # check candidate blocks
-                    for block in blocks_in_table:
-                        cell.add(block)
-                    # process cell blocks further: ensure converting float layout to flow layout
-                    cell.blocks.join_horizontally().split_vertically()
+            table.set_table_contents(blocks_in_table, settings)
 
         # sort in natural reading order and update layout blocks
         blocks.extend(tables)
         self.reset(blocks).sort_in_reading_order()
 
 
-    def collect_stream_lines(self):
+    def collect_stream_lines(self, potential_shadings:list, float_layout_tolerance:float):
         ''' Collect lines of text block, which may contained in a stream table region.
+            ---
+            Args:
+            - potential_shadings: a group of shapes representing potential cell shading
 
             NOTE: PyMuPDF may group multi-lines in a row as a text block while each line belongs to different
             cell. So, deep into line level here when collecting table contents regions.
             
             Table may exist on the following conditions:
-             - (a) lines in blocks are not connected sequently -> determined by current block only
-             - (b) multi-blocks are in a same row (horizontally aligned) -> determined by two adjacent blocks
+             - (a) lines in potential shading -> determined by shapes
+             - (b) lines in blocks are not connected sequently -> determined by current block only
+             - (c) multi-blocks are in a same row (horizontally aligned) -> determined by two adjacent blocks
+             
         '''
-
-        res = [] # type: list[Lines]
-
         # get sub-lines from block
         def sub_lines(block):
-            return block.lines if block.is_text_block() else [Line().update(block.bbox)]
+            return block.lines if block.is_text_block() else [Line().update_bbox(block.bbox)]
 
+        # check block by block
+        res = [] # type: list[Lines]
+        table_lines = Lines() # potential text lines in a table
         new_line = True
-        num = len(self._instances)
-        table_lines = Lines()
-        for i in range(num):
+        num_blocks, num_shadings = len(self._instances), len(potential_shadings)
+        j = 0
+        for i in range(num_blocks):
+
             block = self._instances[i]
-            next_block = self._instances[i+1] if i<num-1 else Block()
+            next_block = self._instances[i+1] if i<num_blocks-1 else Block()
 
             table_end = False
+
+            # (a) block in potential shading?
+            if j < num_shadings:
+                shading = potential_shadings[j]
+                if not shading.is_determined and shading.contains(block, threshold=constants.FACTOR_MOST):
+                    table_lines.extend(sub_lines(block))
+                    new_line = False
+                
+                # move to next shading
+                elif next_block.bbox.y0 > shading.bbox.y1:
+                    j += 1
             
-            # there is gap between these two criteria, so consider condition (a) only if it's the first block in new row.
-            # (a) lines in current block are connected sequently?
+            # (b) lines in current block are connected sequently?
             # yes, counted as table lines
             if new_line and block.contains_discrete_lines(): 
                 table_lines.extend(sub_lines(block))  # deep into line level
@@ -252,9 +307,9 @@ class Blocks(Collection):
                 # update line status
                 new_line = False            
 
-            # (b) multi-blocks are in a same row: check layout with next block?
+            # (c) multi-blocks are in a same row: check layout with next block?
             # yes, add both current and next blocks
-            if block.horizontally_align_with(next_block, factor=0.1):
+            if block.horizontally_align_with(next_block, factor=float_layout_tolerance):
                 # if it's start of new table row: add the first block
                 if new_line: table_lines.extend(sub_lines(block))
                 
@@ -273,7 +328,7 @@ class Blocks(Collection):
                 new_line = True
 
             # NOTE: close table detecting manually if last block
-            if i==num-1: table_end = True
+            if i==num_blocks-1: table_end = True
 
             # end of current table
             if table_lines and table_end: 
@@ -283,7 +338,11 @@ class Blocks(Collection):
         return res
 
 
-    def parse_vertical_spacing(self, bbox:tuple):
+    def parse_spacing(self,
+            line_separate_threshold:float,
+            lines_left_aligned_threshold:float,
+            lines_right_aligned_threshold:float,
+            lines_center_aligned_threshold:float):
         ''' Calculate external and internal vertical space for text blocks.
         
             - paragraph spacing is determined by the vertical distance to previous block. 
@@ -295,30 +354,57 @@ class Blocks(Collection):
                 previous block should be a paragraph).
             
             - line spacing is defined as the average line height in current block.
-
-            ---
-            Args:
-            - bbox: reference boundary of all the blocks
         '''
         if not self._instances: return
 
-        # check text direction
-        # normal reading direction by default, i.e. from left to right, 
-        # the reference boundary is top border, i.e. bbox[1].
-        # regarding vertical text direction, e.g. from bottom to top, left border bbox[0] is the reference
-        idx = 1 if self.is_horizontal else 0
+        # bbox of blocks
+        # - page level, e.g. blocks in top layout
+        # - table level, e.g. blocks in table cell
+        if isinstance(self.parent, Cell):
+            cell = self.parent
+            x0,y0,x1,y1 = cell.bbox
+            w_top, w_right, w_bottom, w_left = cell.border_width
+            bbox = (x0+w_left/2.0, y0+w_top/2.0, x1-w_right/2.0, y1-w_bottom/2.0)        
+        else:
+             bbox = self.parent.bbox
+
+        # check text direction for vertical space calculation:
+        # - normal reading direction (from left to right)    -> the reference boundary is top border, i.e. bbox[1].
+        # - vertical text direction, e.g. from bottom to top -> left border bbox[0] is the reference
+        idx = 1 if self.is_horizontal_text else 0
 
         ref_block = self._instances[0]
         ref_pos = bbox[idx]
 
         for block in self._instances:
+
+            #---------------------------------------------------------
+            # alignment mode and left spacing:
+            # - horizontal block -> take left boundary as reference
+            # - vertical block   -> take bottom boundary as reference
+            #---------------------------------------------------------
+            block.parse_horizontal_spacing(bbox,
+                    line_separate_threshold,
+                    lines_left_aligned_threshold,
+                    lines_right_aligned_threshold,
+                    lines_center_aligned_threshold)            
+
+            #---------------------------------------------------------
+            # vertical space calculation
+            #---------------------------------------------------------
+
             # NOTE: the table bbox is counted on center-line of outer borders, so a half of top border
             # size should be excluded from the calculated vertical spacing
             if block.is_table_block():
                 dw = block[0][0].border_width[0] / 2.0 # use top border of the first cell
 
                 # calculate vertical spacing of blocks under this table
-                block.parse_vertical_spacing()
+                block.parse_spacing(
+                    line_separate_threshold,
+                    lines_left_aligned_threshold,
+                    lines_right_aligned_threshold,
+                    lines_center_aligned_threshold
+                )
             
             else:
                 dw = 0.0
@@ -326,7 +412,7 @@ class Blocks(Collection):
             start_pos = block.bbox[idx] - dw
             para_space = start_pos-ref_pos
 
-            # modify vertical space in case the block is out of bootom boundary
+            # modify vertical space in case the block is out of bottom boundary
             dy = max(block.bbox[idx+2]-bbox[idx+2], 0.0)
             para_space -= dy
             para_space = max(para_space, 0.0) # ignore negative value
@@ -342,18 +428,19 @@ class Blocks(Collection):
                 block.parse_line_spacing()
 
             # if ref to current (image): set before-space for paragraph
-            elif block.is_image_block():
+            elif block.is_inline_image_block():
                 block.before_space = para_space
 
             # ref (paragraph/image) to current: set after-space for ref paragraph        
-            elif ref_block.is_text_block() or ref_block.is_image_block():
+            elif ref_block.is_text_block() or ref_block.is_inline_image_block():
                 ref_block.after_space = para_space
 
             # situation with very low probability, e.g. ref (table) to current (table)
             # we can't set before space for table in docx, but the tricky way is to
             # create an empty paragraph and set paragraph line spacing and before space
             else:
-                block.before_space = para_space
+                # let para_space>=1 Pt to accommodate the dummy paragraph if not the first block
+                block.before_space = max(para_space, int(block!=self._instances[0])*constants.MINOR_DIST)
 
             # update reference block        
             ref_block = block
@@ -364,11 +451,13 @@ class Blocks(Collection):
         # must be remove in other place, especially the page space is run out.
         # Here, reduce the last row of table.
         block = self._instances[-1]
-        if block.is_table_block():
-            block[-1].height -= DM # same value used when creating docx
+        if block.is_table_block(): block[-1].height -= constants.MINOR_DIST
 
 
-    def join_horizontally(self, text_direction=True):
+    def join_horizontally(self, 
+                text_direction:bool, 
+                line_overlap_threshold:float, 
+                line_merging_threshold:float):
         ''' Join lines in horizontally aligned blocks into new TextBlock.
             ---
             Args:
@@ -376,7 +465,7 @@ class Blocks(Collection):
               If True, detect text direction based on line direction;
               if False, use default direction: from left to right.
 
-            This function converts potential float layout into flow layout, e.g. remove overlapped lines, 
+            This function converts potential float layout into flow layout, e.g. 
             reposition inline images, so that make rebuilding such layout in docx possible.
         '''
         # get horizontally aligned blocks group by group
@@ -386,12 +475,25 @@ class Blocks(Collection):
         # merge text blocks in each group
         blocks = []
         for blocks_collection in groups:
-            block = blocks_collection._merge_one()
-            blocks.append(block)
+            # combine all lines into a TextBlock
+            final_block = TextBlock()
+            for block in blocks_collection:
+                if not block.is_text_block(): continue
+                final_block.add(block.lines) # keep empty line, may help to identify table layout
+
+            # merge lines/spans contained in this text block
+            # NOTE:            
+            # Lines in text block must have same property, e.g. height, vertical distance, 
+            # because average line height is used when create docx. However, the contained lines 
+            # may be not reasonable after this step. So, this is just a pre-processing step focusing 
+            # on processing lines in horizontal direction, e.g. merging inline image to its text line.
+            # A further step, e.g. `split_vertically()`, must be applied before final making docx.
+            final_block.lines.join(line_overlap_threshold, line_merging_threshold)
+
+            blocks.append(final_block)
         
         # add table blocks
         blocks.extend(self.table_blocks)
-
         self.reset(blocks)
 
         return self
@@ -411,42 +513,37 @@ class Blocks(Collection):
             if block.is_text_block():
                 blocks.extend(block.split())
             else:
-                blocks.append(block)
-        
+                blocks.append(block)        
+       
         self.reset(blocks).sort_in_reading_order()
 
         return self
 
 
     def parse_text_format(self, rects):
-        '''Parse text format with style represented by rectangles.
+        '''Parse text format with style represented by stroke/fill shapes.
             ---
             Args:
-              - rects: Rectangles, potential styles applied on blocks
+            - rects: Shapes, potential styles applied on blocks
 
             NOTE: `parse_text_format` must be implemented by TextBlock, ImageBlock and TableBlock.
         '''
-        flag = False
-        for block in self._instances:
-            if block.parse_text_format(rects):
-                flag = True        
-        return flag    
+        # parse text block style one by one
+        for block in self._instances: block.parse_text_format(rects)
 
 
-    def make_page(self, doc, page_bbox:tuple):
+    def make_page(self, doc):
         ''' Create page based on parsed block structure. 
             ---
             Args:
             - doc: python-docx Document or _Cell object
-            - page_bbox: page bbox
         '''
         for block in self._instances:
-
             # make paragraphs
             if block.is_text_block():
                 # new paragraph
                 p = doc.add_paragraph()
-                block.make_docx(p, page_bbox)
+                block.make_docx(p)
             
             # make table
             elif block.is_table_block():
@@ -467,37 +564,92 @@ class Blocks(Collection):
                 table = doc.add_table(rows=block.num_rows, cols=block.num_cols)
                 table.autofit = False
                 table.allow_autofit  = False
-                block.make_docx(table, page_bbox)
-                
+                block.make_docx(table)
+
+        # below table processing is necessary for page level
+        if isinstance(self.parent, Cell): return
+        
         # NOTE: If a table is at the end of a page, a new paragraph will be automatically 
         # added by the rending engine, e.g. MS Word, which resulting in an unexpected
         # page break. The solution is to never put a table at the end of a page, so add
         # an empty paragraph and reset its format, particularly line spacing, when a table
         # is created.
-        if bool(self) and self._instances[-1].is_table_block():
+        for block in self._instances[::-1]:
+            # ignore float image block
+            if block.is_float_image_block(): continue
+
+            # nothing to do if not end with table block
+            if not block.is_table_block(): break
+
+            # otherwise, add a small paragraph
             p = doc.add_paragraph()
-            reset_paragraph_format(p, Pt(DM)) # a small line height
+            reset_paragraph_format(p, Pt(constants.MIN_LINE_SPACING)) # a small line height
 
+        # Finally, add floating image to last paragraph
+        p = doc.add_paragraph() if not doc.paragraphs else doc.paragraphs[0]
+        for image_block in self._floating_image_blocks:
+            image_block.make_docx(p)
 
-    def _merge_one(self):
-        ''' Merge all text blocks into one text block.
-            
-            NOTE:            
-            Lines in text block must have same property, e.g. height, vertical distance, 
-            because average line height is used when create docx. However, the contained lines 
-            may be not reasonable after this step. So, this is just a pre-processing step focusing 
-            on processing lines in horizontal direction, e.g. merging inline image to its text line.
-            A further step, e.g. `split_vertically()`, must be applied before final making docx.
-        '''
-        # combine all lines into a TextBlock
-        final_block = TextBlock()
+  
+    def plot(self, page):
+        '''Plot blocks in PDF page.'''
+        # different plot options for table block:
+        #                       cell_content    border_style   border_color         note
+        # lattice table ONLY        N               Y               -           temp Blocks with parent=None
+        # stream table ONLY         N               N         (0.6, 0.7, 0.8)   temp Blocks with parent=None
+        # text & table blocks       Y               N         (1.0, 0.0, 0.0)   layout Blocks with parent=Layout
+        content = not self._parent is None
+        style   = not content and len(self.lattice_table_blocks)
+        color   = (1.0, 0.0, 0.0) if content else (0.6, 0.7, 0.8)
+
         for block in self._instances:
-            if not block.is_text_block(): continue
-            for line in block.lines:
-                final_block.add(line) # keep empty line, may help to identify table layout
+            if block.is_table_block():
+                block.plot(page, content, style, color)
+            else:
+                block.plot(page)
 
-        # merge lines/spans contained in this textBlock
-        final_block.lines.join()
 
-        return final_block
+    @staticmethod
+    def _assign_block_to_tables(block:Block, tables:list, blocks_in_tables:list, blocks:list):
+        '''Collect blocks contained in table region `blocks_in_tables` and rest text blocks in `blocks`.'''
+        # lines in block for further check if necessary
+        lines = block.lines if block.is_text_block() else Lines()
+
+        # collect blocks contained in table region
+        # NOTE: there is a probability that only a part of a text block is contained in table region, 
+        # while the rest is in normal block region.
+        for table, blocks_in_table in zip(tables, blocks_in_tables):
+
+            # fully contained in one table
+            if table.bbox.contains(block.bbox):
+                blocks_in_table.append(block)
+                break
+            
+            # not possible in current table, then check next table
+            elif not table.bbox.intersects(block.bbox): continue
+            
+            # deep into line level for text block
+            elif block.is_text_block():
+                table_lines, not_table_lines = lines.split_with_intersection(table.bbox)
+
+                # add lines to table
+                text_block = TextBlock()
+                text_block.add(table_lines)
+                blocks_in_table.append(text_block)
+
+                # lines not in table for further check
+                if not_table_lines:
+                    lines = not_table_lines
+                else:
+                    break # no more lines
+        
+        # Now, this block (or part of it) belongs to previous layout
+        else:
+            if block.is_table_block():
+                blocks.append(block)
+            else:
+                text_block = TextBlock()
+                text_block.add(lines)
+                blocks.append(text_block)
+
 

@@ -26,41 +26,66 @@ Consider horizontal and vertical borders only.
 '''
 
 
-from ..shape.Rectangles import Rectangles
-from ..shape.Rectangle import Rectangle
-from ..common.utils import expand_centerline, RGB_value
-from ..common.constants import MAX_W_BORDER, HIDDEN_W_BORDER
-from ..common.base import RectType
+from ..shape.Shapes import Shapes
+from ..shape.Shape import Stroke
+from ..common import constants
+from ..common.share import RectType
 
 
 class Border:
 
-    def __init__(self, border_range:tuple=None, borders:tuple=None):
+    def __init__(self, border_type='h', border_range:tuple=None, borders:tuple=None, reference:bool=False):
         '''Border for stream table.
             ---
             Args:
+            - border_type: 'h' - horizontal border; 'v' - vertical border
             - border_range: valid range, e.g. (x0, x1) for vertical border
-            - borders: boundary borders, e.g. top and bottom horizontal borders for current vertical
-            border; left and right vertical borders for current horizontal border. 
+            - borders: boundary borders, e.g. top and bottom horizontal borders for current vertical border; 
+            left and right vertical borders for current horizontal border. 
+            - reference: reference Border is used to show a potential case, which converts to table border when finalized;
+            otherwise, it is ignored.
+            
         '''
+        # border type
+        self.is_horizontal = border_type.upper()=='H'
+        self.finalized = False        # whether the position is determined
+        self.is_reference = reference # whether reference only border
+
         # valid range
         self.set_border_range(border_range)
 
         # boundary borders
         self.set_boundary_borders(borders)
+
+        # the position to be finalized, e.g. y-coordinate for horizontal border
+        self._value = None
         
         # border style
-        self.width = HIDDEN_W_BORDER
-        self.color = RGB_value((1,1,1)) # white by default
-
-        # whether the position is determined
-        self.finalized = False
-
+        self.width = constants.HIDDEN_W_BORDER
+        self.color = 0 # black by default
+        
     
-    def is_valid(self, x:float):
-        '''Whether the given position `x` locates in the valid border range.'''
-        return self.LRange < x < self.URange
-    
+    @property
+    def value(self):
+        ''' Finalized position, e.g. y-coordinate of horizontal border. Average value if not finalized.'''
+        return self._value if self.finalized else (self.LRange+self.URange)/2.0
+
+
+    @property
+    def centerline(self):
+        '''Center line of this border.'''
+        if self.is_horizontal:
+            return (self._LBorder.value, self.value, self._UBorder.value, self.value)
+        else:
+            return (self.value, self._LBorder.value, self.value, self._UBorder.value)
+
+
+    def is_valid(self, value:float):
+        '''Whether the given position locates in the valid border range.'''
+        # consider margin here, but pay attention to underline which may be counted
+        return (self.LRange-constants.MINOR_DIST) <= value <= (self.URange+constants.MINOR_DIST) 
+
+
     def set_border_range(self, border_range):
         '''Set border valid ranges.'''
         if border_range:
@@ -71,6 +96,7 @@ class Border:
         self.URange:float = x1
         return self
 
+
     def set_boundary_borders(self, borders):
         '''Set boundary borders.'''
         if borders:
@@ -79,283 +105,189 @@ class Border:
             lower_border, upper_border = None, None
         self._LBorder:Border = lower_border # left border, or top border
         self._UBorder:Border = upper_border # right border, or bottom border
+        return self    
+
+
+    def finalize_by_value(self, value:float):
+        ''' Finalize border with given position.'''
+        # can be finalized only one time
+        if self.finalized or not self.is_valid(value): return self
+
+        self._value = value
+        self.finalized = True
+        self.is_reference = False
         return self
-    
-    def intersect_length(self, border):
-        '''Intersection of valid range with given Border instance.'''
-        LRange = max(self.LRange, border.LRange)
-        URange = min(self.URange, border.URange)
-        return max(URange-LRange, 0.0)
 
-    @property
-    def centerline(self):
-        raise NotImplementedError
 
-    def to_rect(self):
-        '''COnvert to Rectangle instance.'''
-        centerline = self.centerline
-        bbox = expand_centerline(centerline[0:2], centerline[2:], width=self.width)
+    def finalize_by_stroke(self, stroke:Stroke):
+        ''' Finalize border with specified stroke shape, which is generally a showing border-like shape.
+             
+            NOTE:
+            - the boundary borders may also be affected by this stroke shape.
+            - border-like stroke may be an underline/strike-through.      
+        '''        
+        if self.is_horizontal:
+            # x0, x1, and y of h-stroke
+            low_pos, upper_pos = stroke.x0, stroke.x1
+            value = stroke.y0 # equal to stroke.y1
+        else:
+            # y0, y1 and x of v-stroke
+            low_pos, upper_pos = stroke.y0, stroke.y1
+            value = stroke.x0 # equal to stroke.x1
 
-        # create Rectangle instance
-        rect = Rectangle({'color': self.color}).update(bbox)
-        rect.type = RectType.BORDER # set border style
-        
-        return rect
+        # skip if not in valid range of a border
+        if not self.is_valid(value): return
+
+        # skip if not span in the border direction
+        if low_pos > self._LBorder.URange and upper_pos < self._UBorder.LRange: return
+
+        # now, finalize current border
+        self.finalize_by_value(value)
+        self.color = stroke.color
+        self.width = stroke.width
+
+        # and, try to finalize boundary borders
+        self._LBorder.finalize_by_value(low_pos)
+        self._UBorder.finalize_by_value(upper_pos)
+
+        # update rect type as table border
+        stroke.type = RectType.BORDER
+
+
+    def to_stroke(self):
+        '''Convert to border stroke.'''
+        # ignore if reference only
+        if self.is_reference: return None
+
+        stroke = Stroke({'color': self.color, 'width': self.width}).update_bbox(self.centerline)
+        stroke.type = RectType.BORDER # set border style        
+        return stroke
 
 
 class HBorder(Border):
-
-    def __init__(self, border_range:tuple=None, borders:tuple=None):
-        '''Horizontal border -> to determin y-coordinate.'''
-        super().__init__(border_range, borders)
-        self._y = None
-    
-    @property
-    def y(self):
-        ''' y-coordinate of horizontal border. Average value if not finalized.'''
-        return self._y if self.finalized else (self.LRange+self.URange)/2.0
-
-    @property
-    def centerline(self):
-        '''Center line of this border.'''
-        return (self._LBorder.x, self.y, self._UBorder.x, self.y)
-
-    def finalize(self, y:float):
-        ''' Finalize border with given position.'''
-        # can be finalized only one time
-        if self.finalized or not self.is_valid(y): return self
-        self._y = y
-        self.finalized = True
-        return self
-
-    def finalize_by_rect(self, h_rect:Rectangle):
-        ''' Finalize border with specified horizontal rect, which is generally a showing border.        
-            NOTE: the boundary borders may also be affected by this rect.
-        '''
-        bbox = h_rect.bbox
-        y = (bbox.y0+bbox.y1)/2.0
-
-        # skip if no intersection in y-direction
-        if self.finalized or not self.is_valid(y): return self
-
-        # skip if no intersection in x-ditrection
-        if bbox.x1 <= self._LBorder.LRange or bbox.x0 >= self._UBorder.URange: return self
-
-        # now, it can be used to finalize current border
-        self.finalize(y)
-        self.color = h_rect.color
-        self.width = bbox.y1 - bbox.y0
-
-        # and, try to finalize boundary borders
-        self._LBorder.finalize(bbox.x0)
-        self._UBorder.finalize(bbox.x1)
-
-        return self
+    def __init__(self, border_range:tuple=None, borders:tuple=None, reference:bool=False):
+        '''Horizontal border.'''
+        super().__init__('h', border_range, borders, reference)
 
 
 class VBorder(Border):
-
-    def __init__(self, border_range:tuple=None, borders:tuple=None):
-        '''Vertical border -> to determin x-coordinate.'''
-        super().__init__(border_range, borders)
-        self._x = None
-
-    @property
-    def x(self):
-        ''' x-coordinate of vertical border. Average value if not finalized.'''
-        return self._x if self.finalized else (self.LRange+self.URange)/2.0
-
-    @property
-    def centerline(self):
-        '''Center line of this border.'''
-        return (self.x, self._LBorder.y, self.x, self._UBorder.y)  
-    
-    def finalize(self, x:float):
-        '''Finalize border with given position.'''
-        # can be finalized fo only one time
-        if self.finalized or not self.is_valid(x): return self
-        self._x = x
-        self.finalized = True
-        return self
-    
-    def finalize_by_rect(self, v_rect:Rectangle):
-        ''' Finalize border with specified horizontal rect, which is generally a showing border.        
-            NOTE: the boundary borders may also be affected by this rect.
-        '''
-        bbox = v_rect.bbox
-        x = (bbox.x0+bbox.x1)/2.0
-
-        # skip if no intersection in y-direction
-        if self.finalized or not self.is_valid(x): return self
-
-        # skip if no intersection in x-ditrection
-        if bbox.y1 <= self._LBorder.LRange or bbox.y0 >= self._UBorder.URange: return self
-
-        # now, it can be used to finalize current border
-        self.finalize(x)
-        self.color = v_rect.color
-        self.width = bbox.x1 - bbox.x0
-
-        # and, try to finalize boundary borders
-        self._LBorder.finalize(bbox.y0)
-        self._UBorder.finalize(bbox.y1)
-
-        # update rect type as table border
-        v_rect.type = RectType.BORDER
-
-        return self
+    def __init__(self, border_range:tuple=None, borders:tuple=None, reference:bool=False):
+        '''Vertical border.'''
+        super().__init__('v', border_range, borders, reference)
 
 
 class Borders:
     '''Collection of Border instances.'''
     def __init__(self):
         ''' Init collection with empty borders.'''
-        self._HBorders = [] # type: list[HBorder]
-        self._VBorders = [] # type: list[VBorder]
+        self._instances = [] # type: list[Border]
 
-        # overlap between valid h-border ranges
-        self._dy_max, self._dy_min = 0.0, 0.0
-
-        # overlap between valid v-border ranges
-        self._dx_max, self._dx_min = 0.0, 0.0
 
     def __iter__(self):
-        return (instance for instance in self._HBorders+self._VBorders)
+        return (instance for instance in self._instances)
 
     def __len__(self):
-        return len(self._HBorders) + len(self._VBorders)
+        return len(self._instances)
     
 
-    def add(self, border:Border):
-        '''Add border and update '''
-        if isinstance(border, HBorder):
-            # check intersection with contained h-borders
-            d_max, d_min = self._max_min_intersects(self._HBorders, border)
-            if d_max is not None:
-                self._dy_max = d_max
-                self._dy_min = d_min
-            self._HBorders.append(border)
-        
-        elif isinstance(border, VBorder):
-            # check intersection with contained v-borders
-            d_max, d_min = self._max_min_intersects(self._VBorders, border)
-            if d_max is not None:
-                self._dx_max = d_max
-                self._dx_min = d_min
-            self._VBorders.append(border)
+    def add(self, border:Border): self._instances.append(border)
     
 
-    def extend(self, borders:list):
-        for border in borders: self.add(border)
+    def extend(self, borders:list): self._instances.extend(borders)
 
-    @property
-    def HBorders(self): return self._HBorders
 
-    @property
-    def VBorders(self): return self._VBorders
-
-    def finalize(self, rects:Rectangles):
-        ''' Finalize the position of all borders: to align h-borders or v-borders as more as possible,
-            so to simplify the table structure.
+    def finalize(self, strokes:Shapes, fills:Shapes):
+        ''' Finalize the position of all borders:
+            - follow explicit stroke/border
+            - follow explicit fill/shading
+            - align h-borders or v-borders as more as possible to simplify the table structure.
             ---
             Args:
-            - rects: a group of explicit border rects. Stream table borders should follow these borders.
+            - strokes: a group of explicit border strokes.
+            - fills: a group of explicit cell shadings.
         '''
-        # process h- and v- rects respectively
-        h_rects = list(filter(
-            lambda rect: rect.bbox.width >= rect.bbox.height <= MAX_W_BORDER, rects))
-        for rect in h_rects:
-            for border in self._HBorders:            
-                border.finalize_by_rect(rect)
+        # finalize borders by explicit strokes in first priority
+        self._finalize_by_strokes(strokes)
 
-        v_rects = list(filter(
-            lambda rect: rect.bbox.height > rect.bbox.width <= MAX_W_BORDER, rects))
-        for rect in v_rects:
-            for border in self._VBorders:            
-                border.finalize_by_rect(rect)        
+        # finalize borders by explicit fillings in second priority
+        tmp_strokes = []
+        for fill in fills:
+            if fill.is_determined: continue
 
-        # process un-finalized h-borders further
-        borders = list(filter(lambda border: not border.finalized, self._HBorders))
-        self._finalize_borders(borders, self._dy_min, self._dy_max)
+            x0, y0, x1, y1 = fill.bbox
+            tmp_strokes.extend([
+                Stroke().update_bbox((x0, y0, x1, y0)), # top
+                Stroke().update_bbox((x0, y1, x1, y1)), # bottom
+                Stroke().update_bbox((x0, y0, x0, y1)), # left
+                Stroke().update_bbox((x1, y0, x1, y1))  # right
+            ])
+        self._finalize_by_strokes(tmp_strokes)
 
-        # process un-finalized v-borders further
-        borders = list(filter(lambda border: not border.finalized, self._VBorders))
-        self._finalize_borders(borders, self._dx_min, self._dx_max)
+        # finalize borders by their layout finally:
+        # - un-finalized, and
+        # - not reference-only borders        
+        borders = list(filter(lambda border: not (border.finalized or border.is_reference), self._instances))
+
+        #  h-borders
+        h_borders = list(filter(lambda border: border.is_horizontal, borders))
+        self._finalize_by_layout(h_borders)
+
+        # v-borders
+        v_borders = list(filter(lambda border: not border.is_horizontal, borders))
+        self._finalize_by_layout(v_borders)
 
     
-    @staticmethod
-    def _max_min_intersects(borders, border:Border):
-        '''Get max/min intersection between `borders` and `border`. Return None if no any intersections.'''
-        intersects = list(map(
-            lambda border_: border_.intersect_length(border), borders))
-        intersects = list(filter(
-            lambda border_: border_>0, intersects
-        ))
-        if intersects:
-            return max(intersects), min(intersects)
-        else:
-            return None, None
+    def _finalize_by_strokes(self, strokes:list):
+        '''Finalize borders by explicit strokes.'''
+        for stroke in strokes:
+            if stroke.is_determined: continue
+            
+            for border in self._instances:
+                # horizontal stroke can finalize horizontal border only
+                if stroke.horizontal != border.is_horizontal: continue
+
+                border.finalize_by_stroke(stroke)
 
 
     @staticmethod
-    def _finalize_borders(borders:list, dx_min:float, dx_max:float):
+    def _finalize_by_layout(borders:list):
         ''' Finalize the position of all borders: align borders as more as possible to simplify the table structure.
             ---
             Args:
             - borders: a list of HBorder or VBorder instances
-            - dx_min : minimum length of intersected border range
-            - dx_max : maximum length of intersected border range
             
             Taking finalizing vertical borders for example:
-            - for each border, initialize a group of x-coordinates with spacing `dx` in its valid range
-            - for each x-coordinate, count the intersection status with all borders
-            - merge x-coordinates (using average value) passing through same borders
-            - sort x-coordinates with the count of intersections in decent order
-            - finalize borders with x-coordinate in sorting order consequently
+            - initialize a list of x-coordinates, [x0, x1, x2, ...], with the interval points of each border
+            - every two adjacent x-coordinates forms an interval for checking, [x0, x1], [x1, x2], ...
+            - for each interval, count the intersection status of center point, x=(x0+x1)/2.0, with all borders
+            - sort center point with the count of intersections in decent order
+            - finalize borders with x-coordinate of center points in sorting order consequently
             - terminate the process when all borders are finalized
         '''
-        # no intersection exists for any borders -> it can be finalized right now.
-        if dx_max == 0.0: return
-
-        # resolution 
-        dx = dx_min / 2.0
-
-        # initialize vertical lines and check intersection status
-        x_status = {} # coordinate -> status
+        # collect interval points and sort in x-increasing order
+        x_points = set()
         for border in borders:
-            x = border.LRange+dx
-            while x < border.URange:
-                # intersection status with each border
-                c = list(map(
-                    lambda border: str(int(border.is_valid(x))), borders))
-                x_status[x] = '-'.join(c) # e.g. 1-0-0-1-0-0
-
-                x += dx
-
-        # merge vertical lines if its intersection status is same
-        merged_x_status = {} # status -> coordinate
-        for k, v in x_status.items():
-            if v in merged_x_status:
-                merged_x_status[v].append(k)
-            else:
-                merged_x_status[v] = [k]
+            x_points.add(border.LRange)
+            x_points.add(border.URange)
         
-        # merge vertical lines with average x-coordinates, and
-        # calculate the count of intersected borders for merged lines
-        data = []
-        for k, v in merged_x_status.items():
-            # average coordinate
-            x = sum(v)/len(v)
-            c = list(map(float, k.split('-')))
-            data.append((x, c))
-        
-        # sort per count since preferring the position of line passing through more borders
-        data.sort(key=lambda item: (sum(item[1]), item[0]), reverse=True)
+        x_points = list(x_points)
+        x_points.sort()
+
+        # check intersection status of each intervals
+        x_status = [] # [(x, status), ...]
+        for i in range(len(x_points)-1):
+            x = (x_points[i]+x_points[i+1])/2.0 # cenper point
+            s = list(map(
+                    lambda border: int(border.is_valid(x)), borders))
+            x_status.append((x,s))
+            
+        # sort per count since preferring passing through more borders
+        x_status.sort(key=lambda item: sum(item[1]), reverse=True)
 
         # finalize borders
         num = len(borders)
         current_status = [0] * num
-        for x, status in data:
+        for x, status in x_status:
             # terminate if all borders are finalized
             if sum(current_status) == num: break
 
@@ -370,4 +302,4 @@ class Borders:
 
             # now, finalize borders
             for border, border_status in zip(borders, status):
-                if border_status: border.finalize(x)
+                if border_status: border.finalize_by_value(x)

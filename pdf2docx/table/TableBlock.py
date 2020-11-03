@@ -41,12 +41,13 @@ from ..common import docx
 
 
 class TableBlock(Block):
-    '''Text block.'''
-    def __init__(self, raw:dict={}):
-        super(TableBlock, self).__init__(raw)
+    '''Table block.'''
+    def __init__(self, raw:dict=None):
+        if raw is None: raw = {}
+        super().__init__(raw)
 
         # collect rows
-        self._rows = Rows(None, self).from_dicts(raw.get('rows', []))
+        self._rows = Rows(parent=self).from_dicts(raw.get('rows', []))
 
         # lattice table by default
         self.set_lattice_table_block()
@@ -93,30 +94,44 @@ class TableBlock(Block):
         return res
 
 
-    def plot(self, page, content=True, style=False):
+    def plot(self, page, content:bool, style:bool, color:tuple):
         '''Plot table block, i.e. cell/line/span.
             ---
             Args:
-              - page: fitz.Page object
-              - style: plot cell style if True, e.g. border width, shading
-              - content: plot text blocks if True
+            - page   : fitz.Page object
+            - content: plot text blocks contained in cells if True
+            - style  : plot cell style if True, e.g. border width, shading
+            - color  : border stroke color if style=False
         '''
         for row in self._rows:
-            for cell in row:
-                # ignore merged cells
-                if not cell: continue            
-                
-                # plot different border colors for lattice / stream tables when style=False, 
-                # i.e. table illustration, rather than real style of lattice table
-                bc = (1,0,0) if self.is_lattice_table_block() else (0.6,0.7,0.8)
-                cell.plot(page, content=content, style=style, color=bc)
+            for cell in row:                
+                if not cell: continue  # ignore merged cells   
+                cell.plot(page, content=content, style=style, color=color)
 
-    
+
+    def set_table_contents(self, blocks:list, settings:dict):
+        '''Assign `blocks` to associated cell.'''
+        for row in self._rows:
+            for cell in row:
+                if not cell: continue
+                # check candidate blocks
+                for block in blocks: cell.add(block)
+
+                # rearrange blocks lines
+                cell.blocks.join_horizontally(text_direction=True, 
+                			line_overlap_threshold=settings['line_overlap_threshold'],
+                			line_merging_threshold=settings['line_merging_threshold']).split_vertically()
+
+                # for lattice table, check cell blocks layout further
+                if self.is_lattice_table_block() and not cell.blocks.is_flow_layout(settings['float_layout_tolerance']): 
+                    cell.set_stream_table_layout(settings)                
+
+
     def parse_text_format(self, rects):
         '''Parse text format for blocks contained in each cell.
             ---
             Args:
-              - rects: Rectangles, format styles are represented by these rectangles.
+              - rects: Shapes, format styles are represented by these rectangles.
         '''
         for row in self._rows:
             for cell in row:
@@ -126,30 +141,30 @@ class TableBlock(Block):
         return True # always return True if table is parsed
 
 
-    def parse_vertical_spacing(self):
+    def parse_spacing(self,
+                line_separate_threshold:float,
+                lines_left_aligned_threshold:float,
+                lines_right_aligned_threshold:float,
+                lines_center_aligned_threshold:float):
         ''' Calculate vertical space for blocks contained in table cells.'''
         for row in self._rows:
             for cell in row:
                 if not cell: continue
+                cell.blocks.parse_spacing(
+                    line_separate_threshold,
+                    lines_left_aligned_threshold,
+                    lines_right_aligned_threshold,
+                    lines_center_aligned_threshold)
 
-                # reference for vertical spacing is dependent on text direction
-                x0,y0,x1,y1 = cell.bbox
-                w_top, w_right, w_bottom, w_left = cell.border_width
-                bbox = (x0+w_left/2.0, y0+w_top/2.0, x1-w_right/2.0, y1-w_bottom/2.0)
-                cell.blocks.parse_vertical_spacing(bbox)
 
-
-    def make_docx(self, table, page_bbox:tuple):
+    def make_docx(self, table):
         '''Create docx table.
             ---
             Args:
               - table: docx table instance
-              - page_bbox: page bbox considering margin
         '''
-        # set indent
-        left, *_ = page_bbox
-        pos = self.bbox.x0-left
-        docx.indent_table(table, pos)
+        # set left indent
+        docx.indent_table(table, self.left_space)
 
         # set format and contents row by row
         for idx_row in range(len(table.rows)):

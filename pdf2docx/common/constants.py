@@ -1,22 +1,34 @@
 # -*- coding: utf-8 -*-
 
-import fitz
 
-# margin
-DM = 1.0
+# -------------------------------------
+# basic unit
+# -------------------------------------
+PT = 1.0   # basic unit
+ITP = 72.0 # inch to point
 
-# inch to point
-ITP = 72.0
+MAJOR_DIST = 5.0 * PT   # significant distance exists between two block lines
+MINOR_DIST = 1.0 * PT   # small distance
+TINY_DIST  = 0.5 * PT   # very small distance
 
-# tolerant rectangle area
-DR = fitz.Rect(-DM, -DM, DM, DM) / 2.0
+FACTOR_SAME = 0.99
+FACTOR_ALMOST = 0.95
+FACTOR_MOST = 0.90
+FACTOR_MAJOR = 0.75
+FACTOR_A_HALF = 0.5
+FACTOR_A_FEW = 0.1
+FACTOR_FEW = 0.01
 
-# max/min width of table border in docx
-MAX_W_BORDER = 6.0
-MIN_W_BORDER = 0.25
-HIDDEN_W_BORDER = 0.0 # not show border
 
+# -------------------------------------
+# docx
+# -------------------------------------
+HIDDEN_W_BORDER = 0.0   # do not show border
+MIN_LINE_SPACING = 0.7  # minimum line spacing available in MS word
+
+# -------------------------------------
 # font name mapping
+# -------------------------------------
 # special process on the key:
 # - upper case
 # - delete blanks, '-', '_'

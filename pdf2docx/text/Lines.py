@@ -7,11 +7,11 @@ A group of Line objects.
 @author: train8808@gmail.com
 '''
 
-
+from docx.shared import Pt
 from .Line import Line
-from ..common.utils import get_main_bbox
-from ..common.constants import DM
+from ..common import constants
 from ..common.Collection import Collection
+from ..common.docx import add_stop
 
 
 class Lines(Collection):
@@ -25,16 +25,13 @@ class Lines(Collection):
         first_line = self._instances[0]
         return all(line.same_parent_with(first_line) for line in self._instances)
 
+
     def append(self, line:Line):
-        '''Rewrite. Append a line and update line pid and parent bbox.'''
-        if not line: return
+        '''Override. Append a line and update line pid and parent bbox.'''
+        super().append(line)
 
-        # append line
-        self._instances.append(line)
-
-        # update parent bbox
+        # update original parent id
         if not self._parent is None:
-            self._parent.union(line)
             line.pid = id(self._parent)
 
 
@@ -45,6 +42,7 @@ class Lines(Collection):
             self.append(line)
         return self
 
+
     @property
     def image_spans(self):
         '''Get all ImageSpan instances.'''
@@ -53,29 +51,9 @@ class Lines(Collection):
             spans.extend(line.image_spans)
         return spans
 
-
-    def intersects(self, line:Line):
-        ''' Whether intersection exists between any line and given line.'''
-        is_image_line = bool(line.image_spans)
-        for instance in self._instances:
-
-            # for image line, no any intersection is allowed
-            if instance.image_spans or is_image_line:
-                if instance.bbox.intersects(line.bbox):
-                    return True
-            
-            # otherwise, the overlap tolerance is larger
-            elif get_main_bbox(instance.bbox, line.bbox, threshold=0.5):
-                return True
-        
-        return False
-
     
-    def join(self):
-        ''' Merge lines aligned horizontally in a block. The main purposes:
-            - remove overlapped lines, e.g. floating images
-            - make inline image as a span in text line logically
-        '''
+    def join(self, line_overlap_threshold:float, line_merging_threshold:float):
+        ''' Merge lines aligned horizontally, e.g. make inline image as a span in text line.'''
         # skip if empty
         if not self._instances: return self
     
@@ -83,32 +61,34 @@ class Lines(Collection):
         self.sort()
 
         # check each line
-        lines = Lines([self._instances[0]])
+        lines = Lines()
         for line in self._instances:
+
+            # first line
+            if not lines: lines.append(line)
             
-            # skip if intersection exists
-            if lines.intersects(line):
-                continue
+            # ignore this line if overlap with previous line
+            elif line.get_main_bbox(lines[-1], threshold=line_overlap_threshold):
+                print(f'Ignore Line "{line.text}" due to overlap')
 
             # add line directly if not aligned horizontally with previous line
-            if not line.horizontally_align_with(lines[-1]):
+            elif not line.in_same_row(lines[-1]):
                 lines.append(line)
-                continue
 
             # if it exists x-distance obviously to previous line,
             # take it as a separate line as it is
-            if abs(line.bbox.x0-lines[-1].bbox.x1) > DM:
-                lines.append(line)
-                continue
+            elif abs(line.bbox.x0-lines[-1].bbox.x1) > line_merging_threshold:
+                lines.append(line) 
 
             # now, this line will be append to previous line as a span
-            lines[-1].add(list(line.spans))
+            else:
+                lines[-1].add(list(line.spans))
 
         # update lines in block
-        self.reset(list(lines))
+        self.reset(lines)
 
 
-    def split(self):
+    def split(self, threshold:float):
         ''' Split vertical lines and try to make lines in same original text block grouped together.
 
             To the first priority considering docx recreation, horizontally aligned lines must be assigned to same group.
@@ -117,8 +97,8 @@ class Lines(Collection):
         '''
         # split vertically
         # set a non-zero but small factor to avoid just overlaping in same edge
-        fun = lambda a,b: a.horizontally_align_with(b, factor=0.1)
-        groups = self.group(fun)
+        fun = lambda a,b: a.horizontally_align_with(b, factor=threshold)
+        groups = self.group(fun) 
 
         # check count of lines in each group
         for group in groups:
@@ -131,7 +111,22 @@ class Lines(Collection):
             fun = lambda a,b: a.same_parent_with(b)
             groups = self.group(fun)
 
+        # NOTE: group() may destroy the order of lines, so sort in line level
+        for group in groups: group.sort()
+
         return groups
+
+
+    def strip(self):
+        '''remove redundant blanks of each line.'''
+        # strip each line
+        status = [line.strip() for line in self._instances]
+
+        # update bbox
+        stripped = any(status)
+        if stripped: self._parent.update_bbox(self.bbox)
+
+        return stripped
 
 
     def sort(self):
@@ -168,7 +163,7 @@ class Lines(Collection):
                 lines_in_rows[-1].append(line)
         
         # sort lines in each row: consider text direction
-        idx = 0 if self.is_horizontal else 3
+        idx = 0 if self.is_horizontal_text else 3
         self._instances = []
         for row in lines_in_rows:
             row.sort(key=lambda line: line.bbox[idx])
@@ -177,63 +172,55 @@ class Lines(Collection):
 
     def group_by_columns(self):
         ''' Group lines into columns.'''
-        # sort lines in column first: from left to right, from top to bottom
-        self.sort_in_line_order()
+        # split in columns
+        fun = lambda a,b: a.vertically_align_with(b, text_direction=False)
+        groups = self.group(fun)
         
-        #  lines list in each column
-        cols_lines = [] # type: list[Lines]
-
-        # collect lines column by column
-        col_line = Line()
-        for line in self._instances:
-            # same column group if vertically aligned
-            if col_line.vertically_align_with(line):
-                cols_lines[-1].append(line)
-            
-            # otherwise, start a new column group
-            else:
-                cols_lines.append(Lines([line]))
-                col_line = Line() # reset
-                
-            col_line.union(line)
-
-        return cols_lines
+        # NOTE: increasing in x-direction is required!
+        groups.sort(key=lambda group: group.bbox.x0)
+        return groups
 
 
     def group_by_rows(self):
         ''' Group lines into rows.'''
-        # sort lines in row first mode: from top to bottom, from left to right
-        self.sort_in_reading_order()
+        # split in rows, with original text block considered
+        groups = self.split(threshold=0.0)
 
-        # collect lines row by row
-        rows = [] # type: list[Lines]
-        row_line = Line()
-        for line in self._instances:
-            # same row group if horizontally aligned
-            if row_line.horizontally_align_with(line):
-                rows[-1].append(line)
+        # NOTE: increasing in y-direction is required!
+        groups.sort(key=lambda group: group.bbox.y0)
+
+        return groups
+
+
+    def make_docx(self, p):
+        '''Create lines in paragraph.'''
+        block = self.parent        
+        idx = 0 if block.is_horizontal_text else 3
+        current_pos = block.left_space
+
+        for i, line in enumerate(self._instances):
+
+            # left indentation implemented with tab
+            pos = block.left_space + (line.bbox[idx]-block.bbox[idx])
+            if pos>block.left_space:
+                add_stop(p, Pt(pos), Pt(current_pos))
+
+            # add line
+            line.make_docx(p)
+
+            # hard line break is necessary, otherwise the paragraph structure may change in docx,
+            # which leads to the pdf-based layout calculation becomes wrong
+            line_break = True
+
+            # no more lines after last line
+            if line==self._instances[-1]: line_break = False            
             
-            # otherwise, start a new row group
+            # do not break line if they're indeed in same line
+            elif line.in_same_row(self._instances[i+1]):
+                line_break = False
+            
+            if line_break:
+                p.add_run('\n')
+                current_pos = block.left_space
             else:
-                rows.append(Lines([line]))
-                row_line = Line() # reset
-
-            row_line.union(line)
-        
-        # further step:
-        # merge rows if in same original text block
-        lines_list = [] # type: list[Lines]
-        ref = Lines()
-        for row in rows:
-            # same parent text block: merge to previous group
-            if ref.unique_parent and row.unique_parent and row[0].same_parent_with(ref[0]):
-                lines_list[-1].extend(row)
-            
-            # otherwise, append it directly
-            else:
-                lines_list.append(row)
-            
-            # update reference
-            ref = row
-
-        return lines_list
+                current_pos = pos + line.bbox.width

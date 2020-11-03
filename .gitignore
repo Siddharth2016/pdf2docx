@@ -7,9 +7,11 @@ layout.json
 
 # pdf testing files
 *.pdf
-!demo-*.pdf
+!demo*.pdf
+*coverage*
 
 issue-*/
+feature-*/
 
 # building dir
 build/

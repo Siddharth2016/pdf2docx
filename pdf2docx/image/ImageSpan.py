@@ -7,30 +7,15 @@ Image Span based on same raw data structure with image block.
 @author: train8808@gmail.com
 '''
 
-from ..common import docx, utils
+from io import BytesIO
+from ..common import docx, constants
 from .Image import Image
 
 
 class ImageSpan(Image):
     '''Image span.'''
-    def __init__(self, raw:dict={}):
-        super(ImageSpan, self).__init__(raw)
 
-
-    def store(self):
-        return super(ImageSpan, self).store_image()
-
-
-    def plot(self, page, color:tuple):
-        '''Plot image bbox with diagonal lines.
-            ---
-            Args: 
-              - page: fitz.Page object
-        '''
-        x0, y0, x1, y1 = self.bbox
-        page.drawLine((x0, y0), (x1, y1), color=color, width=1)
-        page.drawLine((x0, y1), (x1, y0), color=color, width=1)
-        page.drawRect(self.bbox, color=color, fill=None, overlay=False)
+    def store(self): return super().store_image()
 
 
     def intersects(self, rect):
@@ -40,15 +25,14 @@ class ImageSpan(Image):
               - rect: fitz.Rect, target bbox
         '''
         # add image span if most of of the image is contained in bbox
-        if utils.get_main_bbox(self.bbox, rect, 0.75):
+        if self.get_main_bbox(rect, constants.FACTOR_MAJOR):
             return self.copy()
         
         # otherwise, ignore image
-        else:
-            return ImageSpan()
+        return ImageSpan()
 
 
     def make_docx(self, paragraph):
         '''Add image span to a docx paragraph.'''
         # add image
-        docx.add_image(paragraph, self.image, self.bbox.x1-self.bbox.x0)
+        docx.add_image(paragraph, BytesIO(self.image), self.bbox.x1-self.bbox.x0)
