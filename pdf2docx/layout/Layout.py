@@ -61,6 +61,9 @@ class Layout:
         data = self.__source_from_page(parent) if parent else {}
         self.restore(data)
 
+        # whether this layout is finalized already
+        self.finalized = data.get('finalized', False)
+
         # plot initial layout for debug purpose: settings['debug']=True
         self.plot()
 
@@ -74,12 +77,12 @@ class Layout:
             'min_border_clearance'           : 2.0, # the minimum allowable clearance of two borders
             'float_image_ignorable_gap'      : 5.0, # float image if the intersection exceeds this value
             'float_layout_tolerance'         : 0.1, # [0,1] the larger of this value, the more tolerable of float layout
-            'page_margin_tolerance_right'    : 5.0, # reduce right page margin to leave more space
             'page_margin_factor_top'         : 0.5, # [0,1] reduce top margin by factor
             'page_margin_factor_bottom'      : 0.5, # [0,1] reduce bottom margin by factor
             'shape_merging_threshold'        : 0.5, # [0,1] merge shape if the intersection exceeds this value
             'shape_min_dimension'            : 2.0, # ignore shape if both width and height is lower than this value
             'line_overlap_threshold'         : 0.9, # [0,1] delete line if the intersection to other lines exceeds this value
+            'line_free_space_ratio_threshold': 0.06,# break line if the ratio of free space to entire line exceeds this value
             'line_merging_threshold'         : 2.0, # combine two lines if the x-distance is lower than this value
             'line_separate_threshold'        : 5.0, # two separate lines if the x-distance exceeds this value
             'lines_left_aligned_threshold'   : 1.0, # left aligned if delta left edge of two lines is lower than this value
@@ -96,25 +99,48 @@ class Layout:
 
 
     @property
-    def margin(self): return self._margin
+    def bbox(self): return (0.0, 0.0, self.width, self.height)
 
 
     @property
-    def parsed(self): return self._margin is not None
+    def working_bbox(self):
+        '''bbox with margin considered.'''
+        x0, y0, x1, y1 = self.bbox
+        L, R, T, B = self.margin
+        return (x0+L, y0+T, x1-R, y1-B)
 
-    
+
     @property
-    def bbox(self):
-        if self._margin is None:
-            return (0, 0, self.width, self.height)
-        else:
-            left, right, top, bottom = self.margin
-            return (left, top, self.width-right, self.height-bottom)
+    def margin(self):
+        '''Calculate page margin, (left, right, top, bottom).'''
+        # return normal page margin if no blocks exist
+        if not self.blocks and not self.shapes: return (constants.ITP, ) * 4
+
+        x0, y0, x1, y1 = self.bbox
+        u0, v0, u1, v1 = self.blocks.bbox | self.shapes.bbox
+
+        # margin
+        left = max(u0-x0, 0.0)
+        right = max(x1-u1-constants.MINOR_DIST, 0.0)
+        top = max(v0-y0, 0.0)
+        bottom = max(y1-v1, 0.0)
+
+        # reduce calculated top/bottom margin to leave some free space
+        top *= self.settings['page_margin_factor_top']
+        bottom *= self.settings['page_margin_factor_bottom']
+
+        # use normal margin if calculated margin is large enough
+        return (
+            min(constants.ITP, left), 
+            min(constants.ITP, right), 
+            min(constants.ITP, top), 
+            min(constants.ITP, bottom)
+            )
 
 
     def reset(self):
         '''Reset Layout object.'''
-        self._margin = None
+        self.finalized = False
 
         # blocks representing text/table contents
         self.blocks = Blocks(parent=self)
@@ -128,8 +154,8 @@ class Layout:
 
     def parse(self):
         ''' Parse page layout.'''
-
-        if self.parsed: return self
+        # parse layout only once
+        if self.finalized: return self
 
         # preprocessing, e.g. change block order, clean negative block
         self.clean_up_blocks()
@@ -148,8 +174,7 @@ class Layout:
         # paragraph / line spacing        
         self.parse_spacing()
 
-        # combine inline and floating objects
-        self.blocks.combine_floating_objects()
+        self.finalized = True
 
         return self
 
@@ -157,9 +182,10 @@ class Layout:
     def store(self):
         '''Store parsed layout.'''
         return {
-            'width': self.width,
+            'finalized': self.finalized,
+            'width' : self.width,
             'height': self.height,
-            'margin': self._margin,
+            'margin': self.margin,
             'blocks': self.blocks.store(),
             'shapes': self.shapes.store(),
         }
@@ -174,16 +200,11 @@ class Layout:
         self.width = data.get('width', 0.0)
         self.height = data.get('height', 0.0)
         
-        # page margin: 
-        # - dict from PyMuPDF: to calculate after cleaning blocks
-        # - restored from json: get margin directly
-        self._margin = data.get('margin', None)
-
         # initialize blocks
-        self.blocks.from_dicts(data.get('blocks', []))
+        self.blocks.restore(data.get('blocks', []))
 
         # initialize shapes: to add rectangles later
-        self.shapes.from_dicts(data.get('shapes', []))
+        self.shapes.restore(data.get('shapes', []))
 
         return self
 
@@ -329,7 +350,7 @@ class Layout:
         raw_paths = page.getDrawings()
 
         # paths to shapes or images
-        paths = Paths(parent=self).from_dicts(raw_paths)
+        paths = Paths(parent=self).restore(raw_paths)
         images, shapes = paths.to_images_and_shapes(
             page,
             self.settings['curve_path_ratio'], 
@@ -371,9 +392,6 @@ class Layout:
         self.blocks.clean_up(self.settings['float_image_ignorable_gap'],
                         self.settings['line_overlap_threshold'],
                         self.settings['line_merging_threshold'])
-        
-        # calculate page margin based on cleaned layout
-        self._margin = self.page_margin()
 
         return self.blocks
 
@@ -387,7 +405,8 @@ class Layout:
                 self.settings['max_border_width'],
                 self.settings['float_layout_tolerance'],
                 self.settings['line_overlap_threshold'],
-                self.settings['line_merging_threshold']
+                self.settings['line_merging_threshold'],
+                self.settings['line_separate_threshold']
             )
 
 
@@ -399,7 +418,8 @@ class Layout:
                 self.settings['max_border_width'],
                 self.settings['float_layout_tolerance'],
                 self.settings['line_overlap_threshold'],
-                self.settings['line_merging_threshold']
+                self.settings['line_merging_threshold'],
+                self.settings['line_separate_threshold']
             )
 
 
@@ -411,59 +431,15 @@ class Layout:
         return self.blocks
  
 
-    def page_margin(self):
-        '''Calculate page margin:
-            - left: MIN(bbox[0])
-            - right: MIN(left, width-max(bbox[2]))
-            - top: MIN(bbox[1])
-            - bottom: height-MAX(bbox[3])
-        '''
-        # return normal page margin if no blocks exist
-        if not self.blocks and not self.shapes:
-            return (constants.ITP, ) * 4                 # 1 Inch = 72 pt
-
-        # consider both blocks and shapes for page margin
-        list_bbox = list(map(lambda x: x.bbox, self.blocks))
-        list_bbox.extend(list(map(lambda x: x.bbox, self.shapes))) 
-
-        # left margin 
-        left = min(map(lambda x: x.x0, list_bbox))
-        left = max(left, 0)
-
-        # right margin
-        x_max = max(map(lambda x: x.x1, list_bbox))
-        right = self.width - x_max \
-            - self.settings['page_margin_tolerance_right']  # consider tolerance: leave more free space
-        right = min(right, left)                            # symmetry margin if necessary
-        right = max(right, 0.0)                             # avoid negative margin
-
-        # top margin
-        top = min(map(lambda x: x.y0, list_bbox))
-        top = max(top, 0)
-
-        # bottom margin
-        bottom = self.height-max(map(lambda x: x.y1, list_bbox))
-        bottom = max(bottom, 0.0)
-
-        # reduce calculated top/bottom margin to left some free space
-        top *= self.settings['page_margin_factor_top']
-        bottom *= self.settings['page_margin_factor_bottom']
-
-        # use normal margin if calculated margin is large enough
-        return (
-            min(constants.ITP, left), 
-            min(constants.ITP, right), 
-            min(constants.ITP, top), 
-            min(constants.ITP, bottom)
-            )
- 
-
     def parse_spacing(self):
         ''' Calculate external and internal vertical space for paragraph blocks under page context 
             or table context. It'll used as paragraph spacing and line spacing when creating paragraph.
         '''
-        self.blocks.parse_spacing(
+        args = (
             self.settings['line_separate_threshold'],
+            self.settings['line_free_space_ratio_threshold'],
             self.settings['lines_left_aligned_threshold'],
             self.settings['lines_right_aligned_threshold'],
-            self.settings['lines_center_aligned_threshold'])
+            self.settings['lines_center_aligned_threshold']
+        )
+        self.blocks.parse_spacing(*args)

@@ -13,7 +13,7 @@ from . import constants
 
 
 class Block(BBox):
-    '''Text block.'''
+    '''Base class for text/image/table blocks.'''
     def __init__(self, raw:dict=None):        
         self._type = BlockType.UNDEFINED
 
@@ -22,6 +22,10 @@ class Block(BBox):
         self.alignment = self.get_alignment(raw.get('alignment', 0))
         self.left_space = raw.get('left_space', 0.0)
         self.right_space = raw.get('right_space', 0.0)
+        self.first_line_space = raw.get('first_line_space', 0.0)
+
+        self.left_space_total = raw.get('left_space_total', 0.0)
+        self.right_space_total = raw.get('right_space_total', 0.0)
 
         # RELATIVE position of tab stops
         self.tab_stops = raw.get('tab_stops', []) 
@@ -35,16 +39,19 @@ class Block(BBox):
 
 
     def is_text_block(self):
-        return self._type==BlockType.TEXT
-
-    def is_image_block(self):
-        return self.is_inline_image_block() or self.is_float_image_block()
+        return self._type==BlockType.TEXT    
     
     def is_inline_image_block(self):
         return self._type==BlockType.IMAGE
     
     def is_float_image_block(self):
         return self._type==BlockType.FLOAT_IMAGE
+    
+    def is_image_block(self):
+        return self.is_inline_image_block() or self.is_float_image_block()
+
+    def is_text_image_block(self):
+        return self.is_text_block() or self.is_inline_image_block()
 
     def is_lattice_table_block(self):
         return self._type==BlockType.LATTICE_TABLE
@@ -76,7 +83,7 @@ class Block(BBox):
                 return t
         return TextAlignment.LEFT
 
-    def parse_horizontal_spacing(self, bbox, *varargs):
+    def parse_horizontal_spacing(self, bbox, *args):
         '''set left alignment by default.'''
         # NOTE: in PyMuPDF CS, horizontal text direction is same with positive x-axis,
         # while vertical text is on the contrarory, so use f = -1 here
@@ -116,23 +123,24 @@ class Block(BBox):
         '''Store attributes in json format.'''
         res = super().store()
         res.update({
-            'type'        : self._type.value,
-            'alignment'   : self.alignment.value,
-            'left_space'  : self.left_space,
-            'right_space' : self.right_space,
-            'before_space': self.before_space,
-            'after_space' : self.after_space,
-            'line_space'  : self.line_space,
-            'tab_stops'   : self.tab_stops
+            'type'             : self._type.value,
+            'alignment'        : self.alignment.value,
+            'left_space'       : self.left_space,
+            'right_space'      : self.right_space,
+            'first_line_space' : self.first_line_space,
+            'before_space'     : self.before_space,
+            'after_space'      : self.after_space,
+            'line_space'       : self.line_space,
+            'tab_stops'        : self.tab_stops,
+            'left_space_total' : self.left_space_total,
+            'right_space_total': self.right_space_total
             })
         return res
 
-    @staticmethod
-    def contains_discrete_lines():
-        ''' Check whether lines in block are discrete, False by default. 
-            Rewrite it if necessary, e.g. in TextBlock.
-        '''
-        return False
+
+    def is_flow_layout(self, *args):
+        ''' Check whether flow layout, True by default. Rewrite it if necessary, e.g. in TextBlock.'''
+        return True
 
 
     def parse_text_format(self, *args, **kwargs):

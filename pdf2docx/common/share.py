@@ -44,10 +44,12 @@ class TextDirection(Enum):
 
 class TextAlignment(Enum):
     '''Block types.'''
-    LEFT    = 0b1000
-    CENTER  = 0b0100
-    RIGHT   = 0b0010
-    JUSTIFY = 0b0001
+    NONE    = -1 # none of left/right/center align -> need TAB stop
+    UNKNOWN = 0  # can't decide, e.g. single line only
+    LEFT    = 1
+    CENTER  = 2
+    RIGHT   = 3
+    JUSTIFY = 4
 
 
 class IText:
@@ -199,8 +201,8 @@ def debug_plot(title:str):
             # check if plot layout
             layout = args[0] # Layout object
             debug = layout.settings.get('debug', False)
-            doc = layout.settings.get('doc', None)
-            filename = layout.settings.get('filename', None)
+            doc = layout.settings.get('debug_doc', None)
+            filename = layout.settings.get('debug_filename', None)
 
             if objects and debug and doc is not None:                
                 # create a new page
